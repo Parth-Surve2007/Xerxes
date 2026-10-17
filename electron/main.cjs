@@ -26,12 +26,14 @@ function backendRoot() {
   if (app.isPackaged) return path.join(process.resourcesPath, 'backend');
   return path.join(__dirname, '..', 'backend');
 }
+function workspaceConfigPath() { return path.join(app.getPath('userData'), 'workspace.json'); }
+function configuredWorkspace() { try { const value=JSON.parse(fs.readFileSync(workspaceConfigPath(),'utf8')).path; if (value && fs.existsSync(value) && fs.statSync(value).isDirectory()) return value; } catch {} return null; }
 
 async function startBackend() {
   startupLog('starting backend');
   apiPort = await freePort();
   const root = backendRoot();
-  const workspace = process.env.XERXES_WORKSPACE || (app.isPackaged ? app.getPath('documents') : path.join(__dirname, '..'));
+  const workspace = process.env.XERXES_WORKSPACE || configuredWorkspace() || (app.isPackaged ? app.getPath('documents') : path.join(__dirname, '..'));
   const database = path.join(app.getPath('userData'), 'xerxes.db');
   const python = process.env.XERXES_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   const localModel = path.join(process.env.LOCALAPPDATA || '', 'Xerxes', 'models', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf');
@@ -88,6 +90,13 @@ app.whenReady().then(async () => {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'Folder grant failed');
     return {cancelled:false,grant:data};
+  });
+  ipcMain.handle('select-workspace', async () => {
+    const picked = await dialog.showOpenDialog({properties:['openDirectory','createDirectory'],title:'Choose Xerxes workspace'});
+    if (picked.canceled || !picked.filePaths[0]) return {cancelled:true};
+    const response = await fetch(`http://127.0.0.1:${apiPort}/api/v1/workspace`, {method:'POST',headers:{'Content-Type':'application/json','X-Xerxes-Grant-Token':grantToken},body:JSON.stringify({path:picked.filePaths[0]})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error?.message || 'Workspace selection failed');
+    fs.writeFileSync(workspaceConfigPath(), JSON.stringify({path:picked.filePaths[0]}), 'utf8'); return {cancelled:false,workspace:data.workspace};
   });
   ipcMain.handle('revoke-folder', async (_event, grantId) => {
     if (typeof grantId !== 'string' || !grantId) throw new Error('invalid grant');

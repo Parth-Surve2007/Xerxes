@@ -13,6 +13,16 @@ const candidates = fs.readdirSync(release)
 if (!candidates.length) throw new Error(`No Xerxes executable found in ${release}`);
 fs.mkdirSync(application, {recursive: true});
 const target = path.join(application, 'Xerxes.exe');
+const unpacked = path.join(release, 'win-unpacked');
+if (fs.existsSync(unpacked)) {
+  try {
+    fs.cpSync(unpacked, application, {recursive: true, force: true});
+  } catch (error) {
+    throw new Error(`Close Xerxes before rebuilding application: ${error.message}`);
+  }
+  console.log(`Application updated: ${target} with packaged runtime resources`);
+  return;
+}
 try { fs.rmSync(target, {force: true}); } catch (error) {
   throw new Error(`Close Xerxes before rebuilding application/Xerxes.exe: ${error.message}`);
 }

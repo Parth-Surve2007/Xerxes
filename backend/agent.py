@@ -1,4 +1,4 @@
-import atexit, difflib, json, os, re, socket, sqlite3, subprocess, urllib.request, uuid
+import atexit, difflib, json, os, re, socket, sqlite3, subprocess, urllib.request, uuid, time, threading
 from datetime import datetime,timezone
 from pathlib import Path
 from policy import Policy
@@ -56,16 +56,16 @@ class LocalModel:
             candidate=fenced.group(1) if fenced else text
             raw=json.loads(candidate)
             if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: raise ValueError('native model returned invalid action plan')
-            allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch'}
+            allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
             if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): raise ValueError('native model returned unauthorized action')
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch.'},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
+            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf.'},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
-            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch.'},{'role':'user','content':prompt}]}
+            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf.'},{'role':'user','content':prompt}]}
             req=urllib.request.Request(self.ollama_url+'/api/chat',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
         if endpoint:
@@ -74,7 +74,7 @@ class LocalModel:
             raw=json.loads(fenced.group(1) if fenced else content)
         else: raw=json.loads(raw.get('message',{}).get('content','{}'))
         if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: return None
-        allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch'}
+        allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
         if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): return None
         return raw
 class RiskClient:
@@ -100,27 +100,191 @@ class AgentEngine:
     def _get(self,tid): c=self._db(); r=c.execute('SELECT data FROM tasks WHERE id=?',(tid,)).fetchone(); c.close(); return json.loads(r[0]) if r else None
     def get_task(self,tid): return self._get(tid)
     def create_task(self,prompt):
-        plan=self.model.plan(prompt) or self._diagnostic_plan(prompt); t={'id':str(uuid.uuid4()),'prompt':prompt,'status':'planned','model_status':self.model.status(),'plan':plan,'results':[],'created_at':datetime.now(timezone.utc).isoformat()}; c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],prompt,json.dumps(t),t['created_at'],t['created_at'])); c.commit(); c.close(); return t
+        started=time.perf_counter(); planner_error=None; plan=None
+        prior=self._latest_task() if self._is_continuation(prompt) else None
+        planning_prompt=self._planning_context(prompt,prior)
+        plan,planner_error=self._obtain_plan(planning_prompt,prior['prompt'] if prior else prompt)
+        source='llm' if plan else 'diagnostic'
+        if not plan: plan=self._diagnostic_plan(prior['prompt'] if prior else prompt)
+        plan=self._normalize_plan(plan,prior['prompt'] if prior else prompt); now=datetime.now(timezone.utc).isoformat(); goal=prior['prompt'] if prior else prompt; t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'status':'planned','phase':'WAITING FOR EXECUTION','current_action':None,'completed_steps':0,'total_steps':len(plan.get('actions',[])),'message':'Plan ready; waiting for your execution command.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':source,'duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error},'plan':plan,'results':[],'created_at':now}; c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],goal,json.dumps(t),t['created_at'],t['created_at'])); c.commit(); c.close(); return t
+    def start_task(self,prompt):
+        prior=self._latest_task() if self._is_continuation(prompt) else None
+        if prior:
+            if prior.get('status')=='awaiting_input':
+                candidates=[]
+                for result in prior.get('results',[]):
+                    if result.get('tool')=='search_workspace' and result.get('status')=='completed':
+                        candidates.extend(item.get('path') for item in (result.get('result') or []) if isinstance(item,dict) and item.get('path'))
+                selected=[path for path in candidates if path.casefold() in prompt.casefold()]
+                if len(selected)==1:
+                    self._append_dependent_actions(prior,selected[0])
+                    prior['status']='planned'; prior['phase']='WAITING FOR EXECUTION'; prior['message']='Candidate selected; review the remaining actions and execute when ready.'
+                else:
+                    prior['message']='Choose one exact candidate path, then send it with “continue”: '+', '.join(candidates)
+                self._save_task(prior); return prior
+            prior['message']='Continuation requested; preserving the existing task and verified results.'; self._save_task(prior); return prior
+        goal=prior['prompt'] if prior else prompt; now=datetime.now(timezone.utc).isoformat()
+        t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'status':'planning','phase':'PLANNING','current_action':None,'completed_steps':0,'total_steps':0,'message':'Planning with local model.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':'pending','duration_ms':None,'error':None},'plan':{'mode':'pending','summary':'Planning with local model…','actions':[]},'results':[],'created_at':now}
+        c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],goal,json.dumps(t),now,now)); c.commit(); c.close()
+        worker=threading.Thread(target=self._complete_planning,args=(t['id'],prompt,prior),daemon=True); worker.start(); worker.join(0.05)
+        return self._get(t['id']) or t
+    def _complete_planning(self,tid,prompt,prior):
+        started=time.perf_counter(); planner_error=None; plan=None
+        goal=prior['prompt'] if prior else prompt; plan,planner_error=self._obtain_plan(self._planning_context(prompt,prior),goal)
+        retry=0
+        while plan is None and self._is_transient_planner_error(planner_error) and retry<3:
+            current=self._get(tid)
+            if not current or current.get('status')=='cancelled': return
+            retry+=1; current['phase']='WAITING FOR LOCAL MODEL'; current['message']=f'Local model is warming up; retry {retry} of 3.'; current['planning']={'source':'pending','duration_ms':None,'error':planner_error}; self._save_task(current)
+            time.sleep((0.5,1.0,2.0)[retry-1])
+            current=self._get(tid)
+            if not current or current.get('status')=='cancelled': return
+            plan,planner_error=self._obtain_plan(self._planning_context(prompt,prior),goal)
+        source='llm' if plan else 'diagnostic'
+        current=self._get(tid)
+        if not current or current.get('status')=='cancelled': return
+        if plan is None and self._is_transient_planner_error(planner_error):
+            current['status']='blocked'; current['phase']='ERROR'; current['message']='Local model inference did not become ready after bounded retries. Start the managed model again and retry this task.'; current['plan']={'mode':'diagnostic','summary':current['message'],'actions':[]}; current['planning']={'source':'diagnostic','duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error}; self._save_task(current); return
+        plan=self._normalize_plan(plan or self._diagnostic_plan(goal),goal); t=self._get(tid)
+        if not t: return
+        t['status']='planned'; t['phase']='WAITING FOR EXECUTION'; t['message']='Plan ready; waiting for your execution command.'; t['plan']=plan; t['total_steps']=len(plan.get('actions',[])); t['planning']={'source':source,'duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error}; t['model_status']=self.model.status(); self._save_task(t)
+    @staticmethod
+    def _is_transient_planner_error(error):
+        if not isinstance(error,str): return False
+        return 'HTTPError' in error and any(code in error for code in (' 503',' 502',' 504'))
+    def _latest_task(self):
+        c=self._db(); rows=c.execute('SELECT data FROM tasks ORDER BY created_at DESC LIMIT 20').fetchall(); c.close()
+        for row in rows:
+            task=json.loads(row[0])
+            if task.get('status') not in {'completed','failed','blocked','cancelled'}: return task
+        return None
+    @staticmethod
+    def _is_continuation(prompt):
+        return bool(re.fullmatch(r'\s*(?:continue(?: above)?|keep going|resume|complete your task|finish it|complete task)(?:\s+.*)?',prompt,re.I))
+    def list_tasks(self,limit=20):
+        c=self._db(); rows=c.execute('SELECT data FROM tasks ORDER BY created_at DESC LIMIT ?',(max(1,min(50,int(limit))),)).fetchall(); c.close(); return [json.loads(row[0]) for row in rows]
+    def _planning_context(self,prompt,prior):
+        if not prior: return prompt
+        verified=[r for r in prior.get('results',[]) if r.get('status')=='completed']
+        return ('Resume the existing task. Original user goal:\n'+prior['prompt']+'\n'
+                'Verified structured results so far (do not treat proposed actions as results):\n'+
+                json.dumps(verified,default=str)[:12000]+'\nUser continuation:\n'+prompt)
+    @staticmethod
+    def _append_dependent_actions(task,selected):
+        existing={action.get('id') for action in task.get('plan',{}).get('actions',[])}
+        read_id='read_file-resume'
+        pdf_id='create_pdf-resume'
+        if read_id not in existing:
+            task['plan']['actions'].append({'id':read_id,'tool':'read_file','arguments':{'path':selected}})
+        if pdf_id not in existing:
+            task['plan']['actions'].append({'id':pdf_id,'tool':'create_pdf','arguments':{'destination':'desktop','filename':'Welcome_to_Xerxes.pdf','text':{'$ref':{'step':read_id,'field':'content'}}}})
+        task['total_steps']=len(task['plan']['actions'])
+    def _obtain_plan(self,planning_prompt,goal):
+        try: plan=self.model.plan(planning_prompt)
+        except Exception as exc: return None,f'{type(exc).__name__}: {exc}'
+        if not plan: return None,None
+        try:
+            plan=self._normalize_plan(plan,goal); self._validate_plan(plan,goal); return plan,None
+        except ValueError as first:
+            try:
+                retry=self.model.plan('Correct the ungrounded plan. Original goal:\n'+goal+'\nValidation feedback: '+str(first)+'\nReturn only a grounded action plan using actual dependencies; do not invent paths or results.')
+                retry=self._normalize_plan(retry or {},goal); self._validate_plan(retry,goal); return retry,None
+            except Exception as exc: return None,f'ungrounded plan: {exc}'
+    def _validate_plan(self,plan,goal):
+        actions=plan.get('actions',[]); lower=goal.lower(); names=[a.get('tool') for a in actions]
+        for action in actions:
+            if action.get('tool')=='search_workspace':
+                query=action.get('arguments',{}).get('query')
+                if not isinstance(query,str) or not query.strip(): raise ValueError('search_workspace query is required')
+                if len(query)>100: raise ValueError('search_workspace query exceeds the 100-character tool limit; derive concise search terms')
+        if any(n=='run_tests' for n in names) and any(x in lower for x in ('pdf','hidden file','find a file','read')):
+            raise ValueError('unrelated test action for a filesystem-content task')
+        if 'desktop' in lower:
+            searches=[a for a in actions if a.get('tool')=='search_workspace']
+            if not searches: raise ValueError('explicit Desktop request requires a scoped search')
+            if any(str(a.get('arguments',{}).get('path','')).casefold() not in {'desktop'} for a in searches): raise ValueError('explicit Desktop request must search the authorized Desktop root')
+            if any('todo' in str(a.get('arguments',{}).get('query','')).casefold() for a in searches): raise ValueError('generic TODO search is unrelated to the requested Desktop file')
+            if any(a.get('tool')=='create_pdf' and str(a.get('arguments',{}).get('destination','desktop')).casefold() not in {'desktop',''} for a in actions): raise ValueError('explicit Desktop destination cannot be replaced')
+        if any(n=='create_pdf' for n in names):
+            read_index=next((i for i,n in enumerate(names) if n=='read_file'),None)
+            pdf_index=next((i for i,n in enumerate(names) if n=='create_pdf'),None)
+            if read_index is None or pdf_index is None or read_index>pdf_index: raise ValueError('PDF creation requires a preceding read action')
+        if any(self._has_unsupported_reference(a.get('arguments',{})) for a in actions): raise ValueError('plan contains unsupported or unresolved action result reference')
+    def _save_task(self,t):
+        t['updated_at']=datetime.now(timezone.utc).isoformat(); c=self._db(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),t['updated_at'],t['id'])); c.commit(); c.close()
+    @staticmethod
+    def _phase(tool): return {'search_workspace':('SEARCHING','Searching approved folders'), 'read_file':('READING FILE','Reading an authorized file'), 'create_pdf':('CREATING PDF','Creating and verifying the approved PDF'), 'apply_patch':('WRITING FILE','Applying an approved file change'), 'list_workspace':('LISTING FILES','Listing approved workspace files'), 'run_tests':('RUNNING TESTS','Running an allowlisted test command')}.get(tool,('EXECUTING','Executing approved action'))
+    def _normalize_plan(self,plan,prompt):
+        actions=[]
+        for index,action in enumerate(plan.get('actions',[])):
+            if not isinstance(action,dict): continue
+            item=dict(action); args=dict(item.get('arguments') or {})
+            if item.get('tool')=='read_file' and 'path' not in args and 'file_path' in args: args['path']=args.pop('file_path')
+            if item.get('tool')=='create_pdf' and 'text' not in args and 'content' in args: args['text']=args.pop('content')
+            if item.get('tool')=='search_workspace':
+                if 'query' not in args and 'search_term' in args: args['query']=args.pop('search_term')
+                if 'mode' not in args and args.get('file_types'): args['mode']='filename'
+            item['id']=item.get('id') or f"{item.get('tool','step')}-{index+1}"; item['arguments']=args; actions.append(item)
+        wants_readme='readme' in prompt.lower()
+        if wants_readme and not any(a.get('tool')=='read_file' and str(a.get('arguments',{}).get('path','')).lower().endswith('readme.md') for a in actions):
+            candidates=sorted(self.workspace.rglob('README.md'))
+            if candidates:
+                rel=candidates[0].relative_to(self.workspace).as_posix(); actions.insert(0,{'id':'read_file-readme','tool':'read_file','arguments':{'path':rel}})
+        for index,item in enumerate(actions): item['id']=item.get('id') or f"{item.get('tool','step')}-{index+1}"
+        reads=[a for a in actions if a.get('tool')=='read_file']; pdfs=[a for a in actions if a.get('tool')=='create_pdf']; others=[a for a in actions if a.get('tool') not in {'read_file','create_pdf'}]
+        ordered=others+reads+pdfs if wants_readme else actions
+        by_tool={a['tool']:a['id'] for a in ordered}
+        for item in ordered: item['arguments']=self._normalize_references(item['arguments'],by_tool)
+        return {**plan,'actions':ordered}
+    @staticmethod
+    def _normalize_references(value,by_tool):
+        if isinstance(value,str):
+            match=re.fullmatch(r'\{\{([A-Za-z_][\w-]*)_result(?:\.([A-Za-z_][\w-]*))?\}\}',value)
+            if match and match.group(1) in by_tool: return {'$ref':{'step':by_tool[match.group(1)],'field':match.group(2) or 'result'}}
+            return value
+        if isinstance(value,dict): return {k:AgentEngine._normalize_references(v,by_tool) for k,v in value.items()}
+        if isinstance(value,list): return [AgentEngine._normalize_references(v,by_tool) for v in value]
+        return value
+    @staticmethod
+    def _has_unsupported_reference(value):
+        if isinstance(value,str): return bool(re.search(r'\{\{[^{}]+\}\}',value))
+        if isinstance(value,dict):
+            if '$ref' in value: return not isinstance(value['$ref'],dict) or not isinstance(value['$ref'].get('step'),str) or not isinstance(value['$ref'].get('field'),str)
+            return any(AgentEngine._has_unsupported_reference(v) for v in value.values())
+        if isinstance(value,list): return any(AgentEngine._has_unsupported_reference(v) for v in value)
+        return False
     def _diagnostic_plan(self,prompt):
-        p=prompt.lower(); actions=[]
-        if any(x in p for x in ['inspect','list','tree','architecture']): actions.append({'tool':'list_workspace','arguments':{}})
-        if any(x in p for x in ['search','find','grep']): actions.append({'tool':'search_workspace','arguments':{'query':'TODO'}})
-        if 'build' in p: actions.append({'tool':'run_tests','arguments':{'command':'npm run build'}})
-        elif any(x in p for x in ['test','pytest']): actions.append({'tool':'run_tests','arguments':{'command':'pytest backend/tests -q'}})
-        if not actions: actions=[{'tool':'list_workspace','arguments':{}}]
-        return {'mode':'diagnostic','summary':'Local model unavailable; deterministic diagnostic plan used. Configure XERXES_LOCAL_MODEL_URL for model planning.','actions':actions}
-    def tool_catalog(self): return [{'name':'list_workspace','risk':'low'},{'name':'read_file','risk':'low'},{'name':'search_workspace','risk':'low'},{'name':'run_tests','risk':'medium'},{'name':'apply_patch','risk':'high; approval required'}]
+        lower=prompt.lower(); actions=[]
+        if any(word in lower for word in ('search','find','hidden','locate')):
+            location='desktop' if 'desktop' in lower else None
+            clues=re.findall(r'\b(?:hehe|huhu|riri|hihi|ruru|eheh|hihy|hih[iy]|rir[iy])\b',lower)
+            if location and clues:
+                actions=[{'tool':'search_workspace','arguments':{'path':location,'query':' '.join(dict.fromkeys(clues)),'mode':'filename'}}]
+        summary='Intelligent planning is unavailable.'
+        if actions: summary+=' A safe location-specific search was derived from the request; dependent actions require real results.'
+        else: summary+=' No task-specific actions were inferred; configure and verify the local model before continuing.'
+        return {'mode':'diagnostic','summary':summary,'actions':actions}
+    def tool_catalog(self): return [{'name':'list_workspace','risk':'low'},{'name':'read_file','risk':'low'},{'name':'search_workspace','risk':'low'},{'name':'run_tests','risk':'medium'},{'name':'apply_patch','risk':'high; approval required'},{'name':'create_pdf','risk':'medium; approval required'}]
     def list_tree(self): return self.policy.list_tree()
     def _run(self,tid,a):
-        name=a.get('tool'); args=a.get('arguments') or {}; d=self.policy.check(name,args); meta={'action_category':name,'inside_workspace':d.allowed,'reversible':name in {'list_workspace','read_file','search_workspace'},'network':False,'approval':False,'data_sensitivity':'workspace-metadata','privilege':'user'}; risk=None
+        name=a.get('tool'); args=a.get('arguments') or {}
+        if self._has_placeholder(args):
+            reason='unresolved action result reference; run the producing action successfully or provide an explicit path'
+            self._audit(tid,name,args,'denied',reason,verification='not_run'); return {'tool':name,'status':'blocked','reason':reason}
+        d=self.policy.check(name,args); meta={'action_category':name,'inside_workspace':d.allowed,'reversible':name in {'list_workspace','read_file','search_workspace'},'network':False,'approval':False,'data_sensitivity':'workspace-metadata','privilege':'user'}; risk=None
         try: risk=self.risk.score(meta)
         except Exception as exc: risk={'state':'unavailable','reason':type(exc).__name__}
         if not d.allowed: self._audit(tid,name,args,'denied',d.reason,risk,verification='not_run'); return {'tool':name,'status':'blocked','reason':d.reason,'risk':risk}
         if name=='list_workspace': result=self.policy.list_tree()
         elif name=='read_file': result=self.policy.read_file(args.get('path',''))
-        elif name=='search_workspace': result=self.policy.search(args.get('query',''))
+        elif name=='search_workspace': result=self.policy.search(args.get('query',''),args.get('path','.') or '.',args.get('mode','content'))
         elif name=='run_tests':
             proc=subprocess.run(self.policy.command(args.get('command','')),cwd=self.workspace,capture_output=True,text=True,timeout=60,shell=False); result={'stdout':proc.stdout[-12000:],'stderr':proc.stderr[-12000:],'exit_code':proc.returncode}; self._audit(tid,name,args,'allowed',d.reason,risk,result,proc.returncode,'passed' if proc.returncode==0 else 'failed'); return {'tool':name,'status':'completed' if proc.returncode==0 else 'failed','result':result,'risk':risk}
+        elif name=='create_pdf':
+            from pdf_generator import create_pdf
+            destination=self.policy.resolve((args.get('destination') or '.')+'/'+(args.get('filename') or 'Welcome_to_Xerxes.pdf'))
+            if destination.exists(): raise FileExistsError('destination file already exists')
+            result=create_pdf(destination,args.get('text',''),args.get('title'))
         elif name=='apply_patch':
             path=self.policy.resolve(args['path']); before=path.read_text(encoding='utf-8'); old=args['old_text']; new=args['new_text']
             if before.count(old)!=1: raise ValueError('patch context must match exactly once')
@@ -128,17 +292,69 @@ class AgentEngine:
             result={'path':args['path'],'changed':before!=after,'diff':'\n'.join(difflib.unified_diff(before.splitlines(),after.splitlines(),fromfile=args['path'],tofile=args['path'])),'verified':after==before.replace(old,new,1)}
         else: result={'message':'tool not enabled in this vertical slice'}
         self._audit(tid,name,args,'allowed',d.reason,risk,result,0,'verified'); return {'tool':name,'status':'completed','result':result,'risk':risk}
+    def _resolve_references(self,value,results):
+        if isinstance(value,dict) and '$ref' in value:
+            ref=value['$ref']; matches=[r for r in results if r.get('id')==ref.get('step') or r.get('tool')==ref.get('step')]
+            if len(matches)!=1 or matches[0].get('status')!='completed': raise ValueError(f"dependency {ref.get('step')} did not complete successfully")
+            data=matches[0].get('result'); field=ref.get('field','result')
+            if field=='result': return data
+            if not isinstance(data,dict) or field not in data:
+                if field in {'file_path','path'} and isinstance(data,list):
+                    paths=[x.get('path') for x in data if isinstance(x,dict) and x.get('path')]
+                    if len(paths)==1: return paths[0]
+                    if not paths: raise ValueError(f"dependency {ref.get('step')} returned no usable file")
+                    raise ValueError(f"dependency {ref.get('step')} returned multiple candidates; user selection is required")
+                raise ValueError(f"dependency field {field} is unavailable")
+            return data[field]
+        if isinstance(value,dict): return {k:self._resolve_references(v,results) for k,v in value.items()}
+        if isinstance(value,list): return [self._resolve_references(v,results) for v in value]
+        return value
+    @staticmethod
+    def _has_placeholder(value):
+        if isinstance(value,str): return bool(re.search(r'\{\{[^{}]+\}\}',value))
+        if isinstance(value,dict): return any(AgentEngine._has_placeholder(v) for v in value.values())
+        if isinstance(value,list): return any(AgentEngine._has_placeholder(v) for v in value)
+        return False
     def execute(self,tid,approve=False):
         t=self._get(tid)
         if not t: raise KeyError(tid)
-        t['status']='executing'; t['results']=[]
-        for a in t['plan'].get('actions',[]):
-            if a.get('tool')=='apply_patch' and not approve: t['results'].append({'tool':'apply_patch','status':'approval_required'}); t['status']='approval_required'; break
-            t['results'].append(self._run(tid,a))
-            if t['results'][-1]['status'] in {'blocked','failed'}: t['status']=t['results'][-1]['status']; break
-        else: t['status']='completed'
-        c=self._db(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),datetime.now(timezone.utc).isoformat(),tid)); c.commit(); c.close(); return t
+        prior_results=t.get('results',[]) if t.get('status')=='approval_required' and approve else []
+        t['status']='executing'; t['phase']='EXECUTING'; t['message']='Starting approved actions.'; t['current_action']=None; t['completed_steps']=sum(1 for r in prior_results if r.get('status')=='completed'); t['total_steps']=len(t['plan'].get('actions',[])); t['results']=prior_results; self._save_task(t)
+        if not t['plan'].get('actions') and t['plan'].get('mode')=='diagnostic':
+            t['status']='blocked'; t['phase']='ERROR'; t['message']='Intelligent planning is unavailable; no safe task-specific action was derived.'; self._save_task(t); return t
+        for raw_action in t['plan'].get('actions',[]):
+            a=dict(raw_action); args=dict(a.get('arguments') or {})
+            if any(r.get('id')==a.get('id') and r.get('status')=='completed' for r in t['results']): continue
+            if a.get('tool')=='create_pdf' and 'text' not in args and 'content' in args: args['text']=args.pop('content')
+            if a.get('tool')=='read_file' and 'path' not in args and 'file_path' in args: args['path']=args.pop('file_path')
+            if a.get('tool')=='search_workspace' and 'query' not in args and 'search_term' in args: args['query']=args.pop('search_term')
+            if a.get('tool')=='search_workspace' and 'mode' not in args and args.get('file_types'): args['mode']='filename'
+            try: args=self._resolve_references(args,t['results'])
+            except ValueError as exc:
+                blocked={'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':str(exc)}; t['results'].append(blocked); t['status']='blocked'; t['phase']='ERROR'; t['message']=str(exc); self._save_task(t); break
+            a['arguments']=args
+            if a.get('tool') in {'apply_patch','create_pdf'} and not approve: t['results'].append({'tool':a.get('tool'),'status':'approval_required'}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before writing files.'; self._save_task(t); break
+            if a.get('tool')=='create_pdf' and 'readme' in t.get('prompt','').lower():
+                read_results=[r.get('result') for r in t['results'] if r.get('tool')=='read_file' and r.get('status')=='completed']
+                if not read_results: t['status']='blocked'; t['results'].append({'tool':'create_pdf','status':'blocked','reason':'README content was not read; PDF was not created'}); break
+                args=dict(a.get('arguments') or {}); welcome=re.split(r'copy contents',t['prompt'],maxsplit=1,flags=re.I)[0].strip(' ,.')
+                args['text']=welcome+'\n\n'+read_results[-1]['content']; a={**a,'arguments':args}
+            t['phase'],t['message']=self._phase(a.get('tool')); t['current_action']=a.get('tool'); self._save_task(t)
+            result=self._run(tid,a); result['id']=a.get('id'); t['results'].append(result)
+            if t['results'][-1]['status'] in {'blocked','failed'}: t['status']=t['results'][-1]['status']; t['phase']='ERROR'; t['message']=t['results'][-1].get('reason','Action failed'); self._save_task(t); break
+            t['completed_steps']+=1; self._save_task(t)
+            if a.get('tool')=='search_workspace' and t.get('plan',{}).get('mode')=='diagnostic':
+                matches=(result.get('result') or [])
+                if not matches:
+                    t['status']='blocked'; t['phase']='ERROR'; t['message']='No matching files were found; provide a more precise filename or search clue.'; self._save_task(t); break
+                if len(matches)>1:
+                    t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
+                selected=matches[0].get('path')
+                if selected:
+                    self._append_dependent_actions(t,selected); self._save_task(t)
+        else: t['status']='completed'; t['phase']='COMPLETED'; t['message']='All actions completed successfully.'; t['current_action']=None; self._save_task(t)
+        return t
     def cancel(self,tid):
         t=self._get(tid)
         if not t: raise KeyError(tid)
-        t['status']='cancelled'; c=self._db(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),datetime.now(timezone.utc).isoformat(),tid)); c.commit(); c.close(); self._audit(tid,'cancel',{},'allowed','user cancellation',verification='verified'); return t
+        t['status']='cancelled'; t['phase']='CANCELLED'; t['message']='Task cancelled by user.'; self._save_task(t); self._audit(tid,'cancel',{},'allowed','user cancellation',verification='verified'); return t

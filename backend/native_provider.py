@@ -72,7 +72,7 @@ class NativeProvider:
             error = ctypes.create_string_buffer(1024)
             instruction = ("You are Xerxes planning safe workspace actions. Return ONLY one valid JSON object, with no explanation or markdown. "
                            "It must contain an actions array. Each action must contain tool and arguments. "
-                           "Allowed tools are list_workspace, read_file, search_workspace, run_tests, apply_patch. "
+                           "Allowed tools are list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf. "
                            "User request: " + prompt)
             code = self._lib.xerxes_model_generate(self._handle, instruction.encode(), 128, output, len(output), error, len(error))
             if code < 0:

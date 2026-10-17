@@ -43,3 +43,17 @@ def test_link_escape_write_destination_is_rejected(tmp_path):
     except (OSError,NotImplementedError) as exc: pytest.skip(f'cannot create Windows symlink/junction: {exc}')
     store=GrantStore(tmp_path/'grants.json'); store.add(approved); policy=Policy(approved,store)
     assert not policy.check('apply_patch', {'path':str(link/'new.txt'),'old_text':'','new_text':'x'}).allowed
+
+def test_search_finds_nested_file_in_granted_root_and_alias(tmp_path):
+    workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; nested=desktop/'one'/'two'; workspace.mkdir(); nested.mkdir(parents=True)
+    (nested/'hihi.txt').write_text('hello huhu marker',encoding='utf-8')
+    store=GrantStore(tmp_path/'grants.json'); store.add(desktop); policy=Policy(workspace,store)
+    results=policy.search('hihi','desktop',mode='filename')
+    assert len(results)==1 and results[0]['path'].endswith('hihi.txt') and results[0]['match']=='filename'
+
+def test_search_stops_after_grant_revocation(tmp_path):
+    workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; workspace.mkdir(); desktop.mkdir()
+    (desktop/'note.txt').write_text('revocation marker',encoding='utf-8')
+    store=GrantStore(tmp_path/'grants.json'); grant=store.add(desktop); policy=Policy(workspace,store)
+    assert policy.search('revocation','desktop'); store.revoke(grant['id'])
+    with pytest.raises(ValueError): policy.search('revocation','desktop')

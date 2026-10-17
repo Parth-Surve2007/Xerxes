@@ -6,9 +6,10 @@ from agent import AgentEngine
 from capabilities import catalog
 
 app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=512*1024
-CORS(app, origins=os.environ.get('XERXES_CORS_ORIGINS','http://localhost:5173').split(','))
+CORS(app, origins=os.environ.get('XERXES_CORS_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(','))
 DB_PATH=os.environ.get('XERXES_DATABASE',str(Path(__file__).resolve().parent/'xerxes.db'))
 WORKSPACE=Path(os.environ.get('XERXES_WORKSPACE',Path(__file__).resolve().parents[1])).resolve(); engine=AgentEngine(WORKSPACE,DB_PATH)
+MAX_TASK_PROMPT=32*1024
 def err(message,code=400): return jsonify({'error':{'message':message}}),code
 @app.get('/api/v1/health')
 def health(): return jsonify({'status':'ok','product':'xerxes','architecture':platform.machine(),'workspace':str(WORKSPACE),'model':engine.model.status(),'risk_service':engine.risk.status()})
@@ -20,15 +21,33 @@ def audit(): return jsonify({'items':engine.audit(min(100,max(1,int(request.args
 def tree():
     try: return jsonify({'root':str(WORKSPACE),'items':engine.list_tree()})
     except ValueError as exc: return err(str(exc),403)
+@app.post('/api/v1/workspace')
+def set_workspace():
+    token=os.environ.get('XERXES_GRANT_TOKEN','')
+    if not token or request.headers.get('X-Xerxes-Grant-Token') != token: return err('trusted workspace mediation required',403)
+    try:
+        candidate=Path((request.get_json(silent=True) or {}).get('path','')).resolve()
+        if not candidate.is_dir(): raise ValueError('workspace folder is invalid')
+        engine.workspace=candidate; engine.policy.root=candidate
+        return jsonify({'workspace':str(candidate)})
+    except (ValueError,OSError) as exc: return err(str(exc),400)
 @app.post('/api/v1/tasks')
 def create_task():
-    prompt=(request.get_json(silent=True) or {}).get('prompt','').strip()
+    payload=request.get_json(silent=True) or {}
+    prompt=payload.get('prompt','')
+    if not isinstance(prompt,str): return err('prompt must be text')
+    prompt=prompt.strip()
     if not prompt: return err('prompt is required')
-    try: return jsonify(engine.create_task(prompt)),201
+    if len(prompt)>MAX_TASK_PROMPT: return err(f'prompt exceeds the {MAX_TASK_PROMPT}-character task limit')
+    try: return jsonify(engine.start_task(prompt)),202
     except (RuntimeError, ValueError) as exc: return err(str(exc),503 if isinstance(exc,RuntimeError) else 422)
 @app.get('/api/v1/tasks/<task_id>')
 def get_task(task_id):
     task=engine.get_task(task_id); return jsonify(task) if task else err('task not found',404)
+@app.get('/api/v1/tasks')
+def list_tasks():
+    try: return jsonify({'items':engine.list_tasks(request.args.get('limit',20))})
+    except (TypeError,ValueError): return err('invalid task limit')
 @app.post('/api/v1/tasks/<task_id>/execute')
 def execute_task(task_id):
     try: return jsonify(engine.execute(task_id,bool((request.get_json(silent=True) or {}).get('approve',False))))
@@ -56,4 +75,4 @@ def revoke_grant(grant_id):
     if not token or request.headers.get('X-Xerxes-Grant-Token') != token: return err('trusted grant mediation required',403)
     try: engine.grants.revoke(grant_id); return jsonify({'revoked':grant_id})
     except KeyError: return err('grant not found',404)
-if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT',5000)),debug=False)
+if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT',5000)),debug=False,threaded=True)
