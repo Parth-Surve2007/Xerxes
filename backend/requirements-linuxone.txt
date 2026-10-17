@@ -1,0 +1,11 @@
+# Pure-Python packages installed into the LinuxONE venv.
+Flask==3.1.0
+flask-cors==5.0.1
+gunicorn==23.0.0
+requests==2.32.3
+pytest==8.3.4
+
+# Native s390x scientific packages are installed from Ubuntu Noble ports:
+# sudo apt-get install -y python3-numpy python3-scipy python3-sklearn
+# The venv is created with --system-site-packages so these compiled packages
+# are used by the real recommendation engine without an x86-only wheel.

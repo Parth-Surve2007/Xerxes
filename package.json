@@ -1,0 +1,42 @@
+{
+  "name": "xerxes-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first Windows desktop computer agent",
+  "author": "Xerxes",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "desktop:dev": "node electron/dev-supervisor.cjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "desktop:build": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder && node scripts/update-application.cjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^36.3.2",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.xerxes.agent",
+    "productName": "Xerxes",
+    "asar": true,
+    "files": ["dist/**/*", "electron/**/*", "package.json"],
+    "extraResources": [{"from":"backend","to":"backend","filter":["**/*","!**/*.db","!**/__pycache__/**","!tests/**","!smoke_test.py","!requirements*.txt"]}],
+    "directories": {"output":"release"},
+    "win": {"target":["nsis","portable"],"artifactName":"Xerxes-${version}-${arch}.${ext}"},
+    "nsis": {"oneClick":false,"allowToChangeInstallationDirectory":true,"createDesktopShortcut":true}
+  }
+}

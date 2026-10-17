@@ -1,0 +1,4 @@
+Flask==3.1.0
+flask-cors==5.0.1
+scikit-learn==1.4.1.post1
+gunicorn==23.0.0
