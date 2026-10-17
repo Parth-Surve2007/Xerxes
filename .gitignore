@@ -4,7 +4,16 @@ __pycache__/
 *.pyc
 backend/*.db
 .env
+.env.*
 .venv/
 .pytest_cache/
 release/
 release-test/
+application/
+.vscode/
+*.gguf
+models/
+runtime/
+native-source/
+native-build*/
+*.db
