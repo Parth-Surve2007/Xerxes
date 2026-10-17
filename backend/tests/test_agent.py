@@ -55,6 +55,46 @@ def test_successful_planner_response_controls_plan(tmp_path,monkeypatch):
     task=module.engine.create_task('find something')
     assert task['planning']['source']=='llm' and task['plan']['summary']=='model selected read'
 
+def test_planner_registry_name_is_normalized_to_canonical_tool(tmp_path,monkeypatch):
+    import app as module
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'actions':[{'name':'list_workspace','arguments':{}}]}
+    task=module.engine.create_task('list files')
+    assert task['planning']['source']=='llm'
+    assert task['plan']['actions'][0]['tool']=='list_workspace'
+    assert 'name' not in task['plan']['actions'][0]
+
+def test_llama_response_array_and_dot_dependencies_are_normalized(tmp_path,monkeypatch):
+    import agent as agent_module, app as module
+    payload={'choices':[{'message':{'content':'```json\n['
+        '{"tool":"search_workspace","arguments":{"query":"hihi","path":"Desktop","mode":"filename"}},'
+        '{"tool":"read_file","arguments":{"path":"{{search_workspace.result}}"}},'
+        '{"tool":"create_pdf","arguments":{"filename":"out.pdf","destination":"Desktop","text":"{{read_file.result.content}}"}}'
+        ']\n```'}}]}
+    class Response:
+        status=200
+        def __enter__(self): return self
+        def __exit__(self,*args): return False
+        def read(self): return json.dumps(payload).encode()
+    monkeypatch.setenv('XERXES_LOCAL_MODEL_URL','http://127.0.0.1:56322')
+    monkeypatch.setattr(agent_module.urllib.request,'urlopen',lambda *args,**kwargs: Response())
+    model=agent_module.LocalModel()
+    raw=model.plan('find and read hihi in Desktop and create a PDF')
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    plan=module.engine._normalize_plan(raw,'find and read hihi in Desktop and create a PDF')
+    assert [item['tool'] for item in plan['actions']]==['search_workspace','read_file','create_pdf']
+    assert plan['actions'][1]['arguments']['path']['$ref']['field']=='result'
+    assert plan['actions'][2]['arguments']['text']['$ref']['field']=='content'
+
+def test_empty_planner_response_records_runtime_state(tmp_path,monkeypatch):
+    import app as module
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt: None
+    module.engine.model.status=lambda: {'state':'ready','provider':'llama.cpp-openai'}
+    task=module.engine.create_task('list files')
+    assert task['planning']['source']=='diagnostic'
+    assert task['planning']['error']=='planner returned no usable action plan (runtime state: ready)'
+
 def test_unavailable_planner_has_read_only_diagnostic_fallback(tmp_path,monkeypatch):
     import app as module
     module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
@@ -113,6 +153,25 @@ def test_supported_search_result_reference_resolves_to_actual_read(tmp_path,monk
     done=module.engine.execute(task['id'])
     assert done['status']=='completed' and done['results'][1]['result']['content']=='genuine source text'
 
+def test_http_bare_selected_path_and_content_references_bind_real_results(tmp_path,monkeypatch):
+    import app as module, time
+    (tmp_path/'hihi.txt').write_text('actual discovered content',encoding='utf-8')
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'actions':[
+        {'tool':'search_workspace','arguments':{'query':'hihi','mode':'filename'}},
+        {'tool':'read_file','arguments':{'path':'selected_file_path'}},
+        {'tool':'create_pdf','arguments':{'filename':'bound.pdf','destination':'.','text':'read_file.result.content'}}]}
+    client=module.app.test_client(); created=client.post('/api/v1/tasks',json={'prompt':'find hihi and create a PDF'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    pending=client.post('/api/v1/tasks/'+created['id']+'/execute').get_json()
+    assert pending['status']=='approval_required'
+    assert [item['tool'] for item in pending['results']]==['search_workspace','read_file','create_pdf']
+    assert pending['results'][1]['result']['content']=='actual discovered content'
+    assert pending['results'][2]['status']=='approval_required'
+
 def test_start_task_persists_planning_state_before_slow_model_returns(tmp_path,monkeypatch):
     import app as module, time
     module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
@@ -163,13 +222,14 @@ def test_invalid_model_output_is_not_classified_as_warmup(tmp_path,monkeypatch):
     assert current['planning']['source']=='diagnostic' and current['planning']['error'].startswith('ValueError') and len(calls)==1
 
 def test_cancellation_during_model_warmup_stops_retry(tmp_path,monkeypatch):
-    import app as module, agent, urllib.error
+    import app as module, agent, urllib.error, threading, time
     module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db')); holder={}
-    def stop_sleep(_):
-        if holder.get('id'): module.engine.cancel(holder['id'])
-    monkeypatch.setattr(agent.time,'sleep',stop_sleep)
-    module.engine.model.plan=lambda prompt: (_ for _ in ()).throw(urllib.error.HTTPError('http://local',503,'warming',None,None))
-    task=module.engine.start_task('list files'); holder['id']=task['id']; module.engine.cancel(task['id'])
+    release=threading.Event()
+    def plan(prompt):
+        release.wait(1)
+        raise urllib.error.HTTPError('http://local',503,'warming',None,None)
+    module.engine.model.plan=plan
+    task=module.engine.start_task('list files'); holder['id']=task['id']; module.engine.cancel(task['id']); release.set(); time.sleep(.05)
     assert module.engine.get_task(task['id'])['status']=='cancelled'
 
 def test_transient_retry_exposes_waiting_phase_before_second_attempt(tmp_path,monkeypatch):
@@ -204,6 +264,118 @@ def test_continuation_with_candidate_path_adds_only_dependent_steps(tmp_path,mon
     resumed=module.engine.start_task('continue '+str(tmp_path/'chosen.txt'))
     tools=[a['tool'] for a in resumed['plan']['actions']]
     assert resumed['id']==task['id'] and tools[-2:]==['read_file','create_pdf']
+
+def test_multi_candidate_selection_endpoint_resumes_same_task(tmp_path,monkeypatch):
+    import app as module, json
+    root=tmp_path/'workspace'; root.mkdir(); (root/'one.txt').write_text('one',encoding='utf-8'); (root/'two.txt').write_text('two',encoding='utf-8')
+    module.engine=module.AgentEngine(root,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'actions':[{'tool':'search_workspace','arguments':{'query':'txt','mode':'filename'}},{'tool':'read_file','arguments':{'path':{'$ref':{'step':'search_workspace-1','field':'path'}}}}]}
+    task=module.engine.create_task('find txt files')
+    client=module.app.test_client()
+    pending=client.post(f"/api/v1/tasks/{task['id']}/execute").get_json()
+    assert pending['status']=='awaiting_input' and len(pending['candidates'])==2
+    bad=client.post(f"/api/v1/tasks/{task['id']}/select",json={'candidate_id':'candidate-99'})
+    assert bad.status_code==403
+    resumed=client.post(f"/api/v1/tasks/{task['id']}/select",json={'candidate_id':'candidate-1'}).get_json()
+    assert resumed['id']==task['id'] and resumed['status']=='planned'
+    assert resumed['selected_candidate']['path']==resumed['candidates'][0]['path']
+
+def test_http_diagnostic_single_candidate_continues_to_read_and_pdf(tmp_path,monkeypatch):
+    import app as module, time
+    workspace=tmp_path/'workspace'; workspace.mkdir(); desktop=tmp_path/'Desktop'; desktop.mkdir()
+    source=desktop/'hihi.txt'; source.write_text('actual diagnostic source',encoding='utf-8')
+    module.engine=module.AgentEngine(workspace,str(tmp_path/'agent.db')); module.engine.grants.add(desktop); module.engine.model.plan=lambda prompt: None
+    client=module.app.test_client()
+    created=client.post('/api/v1/tasks',json={'prompt':'Find hihi in Desktop and create a PDF'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    pending=client.post('/api/v1/tasks/'+created['id']+'/execute').get_json()
+    assert pending['id']==created['id'] and pending['status']=='approval_required'
+    assert [result['tool'] for result in pending['results']]==['search_workspace','read_file','create_pdf']
+    assert pending['results'][1]['result']['content']=='actual diagnostic source'
+    done=client.post('/api/v1/tasks/'+created['id']+'/execute',json={'approve':True}).get_json()
+    assert done['id']==created['id'] and done['status']=='completed'
+
+def test_http_diagnostic_zero_matches_stops_without_dependent_actions(tmp_path,monkeypatch):
+    import app as module, time
+    workspace=tmp_path/'workspace'; workspace.mkdir(); desktop=tmp_path/'Desktop'; desktop.mkdir()
+    module.engine=module.AgentEngine(workspace,str(tmp_path/'agent.db')); module.engine.grants.add(desktop); module.engine.model.plan=lambda prompt: None
+    client=module.app.test_client()
+    created=client.post('/api/v1/tasks',json={'prompt':'Find hihi in Desktop and create a PDF'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    done=client.post('/api/v1/tasks/'+created['id']+'/execute').get_json()
+    assert done['status']=='blocked' and len(done['results'])==1 and 'No matching files' in done['message']
+
+def test_cancellation_between_actions_prevents_dependent_action(tmp_path,monkeypatch):
+    import app as module, json
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    task=module.engine.create_task('list files')
+    task['plan']={'actions':[{'id':'one','tool':'list_workspace','arguments':{}},{'id':'two','tool':'list_workspace','arguments':{}}]}
+    with module.engine._db() as c: c.execute('UPDATE tasks SET data=? WHERE id=?',(json.dumps(task),task['id'])); c.commit()
+    original=module.engine._run
+    def run_once(tid,action):
+        result=original(tid,action)
+        module.engine.cancel(tid)
+        return result
+    module.engine._run=run_once
+    done=module.engine.execute(task['id'])
+    assert done['status']=='cancelled' and len(done['results'])==1 and done['completed_steps']==1
+
+def test_unexpected_action_exception_is_terminal_and_not_completed(tmp_path,monkeypatch):
+    import app as module, json
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    task=module.engine.create_task('list files')
+    task['plan']={'actions':[{'id':'one','tool':'list_workspace','arguments':{}}]}
+    with module.engine._db() as c: c.execute('UPDATE tasks SET data=? WHERE id=?',(json.dumps(task),task['id'])); c.commit()
+    module.engine._run=lambda tid,action: (_ for _ in ()).throw(OSError('fixture failure'))
+    done=module.engine.execute(task['id'])
+    assert done['status']=='failed' and done['phase']=='ERROR' and done['completed_steps']==0
+    assert 'fixture failure' in done['results'][0]['reason']
+
+def test_http_task_lifecycle_uses_fake_model_plan(tmp_path,monkeypatch):
+    import app as module, time
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'summary':'endpoint model plan','actions':[{'tool':'list_workspace','arguments':{}}]}
+    client=module.app.test_client()
+    created=client.post('/api/v1/tasks',json={'prompt':'list approved files'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    assert current['planning']['source']=='llm' and current['plan']['summary']=='endpoint model plan'
+    done=client.post('/api/v1/tasks/'+created['id']+'/execute').get_json()
+    assert done['status']=='completed' and done['results'][0]['tool']=='list_workspace'
+
+def test_http_grounding_rejects_unrelated_model_plan(tmp_path,monkeypatch):
+    import app as module, time
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'actions':[{'tool':'run_tests','arguments':{'command':'pytest backend/tests -q'}}]}
+    client=module.app.test_client()
+    created=client.post('/api/v1/tasks',json={'prompt':'Find hidden hihi in Desktop and create a PDF'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    assert current['planning']['source']=='diagnostic'
+    assert [action['tool'] for action in current['plan']['actions']]==['search_workspace']
+
+def test_async_planner_accepts_consumed_legacy_search_fields(tmp_path,monkeypatch):
+    import app as module, time
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'actions':[{'tool':'search_workspace','arguments':{'query':'hihi','file_types':['.txt']}}]}
+    client=module.app.test_client()
+    created=client.post('/api/v1/tasks',json={'prompt':'Find hihi in the approved workspace'}).get_json()
+    for _ in range(20):
+        current=client.get('/api/v1/tasks/'+created['id']).get_json()
+        if current['status']!='planning': break
+        time.sleep(.01)
+    assert current['planning']['source']=='llm'
+    assert current['plan']['actions'][0]['arguments']=={'query':'hihi','mode':'filename'}
 
 def test_long_task_prompt_is_not_used_as_search_query(tmp_path,monkeypatch):
     import app as module

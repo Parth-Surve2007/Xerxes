@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 import os
 import re
+import logging
+logger=logging.getLogger(__name__)
 class Decision:
     def __init__(self,allowed,reason): self.allowed=allowed; self.reason=reason
 class Policy:
@@ -11,10 +13,38 @@ class Policy:
     def roots(self): return [self.root]+[Path(x['path']).resolve() for x in (self.grants.list() if self.grants else [])]
     def resolve(self,relative):
         if not relative: raise ValueError('path is required')
+        relative_text=str(relative).replace('\\','/')
+        if relative_text.casefold()=='desktop' or relative_text.casefold().startswith('desktop/'):
+            desktop=[root for root in self.roots() if root.name.casefold()=='desktop']
+            if not desktop: raise ValueError('Desktop is not an approved folder')
+            relative=str(desktop[0]/relative_text.split('/',1)[1]) if '/' in relative_text else str(desktop[0])
         candidate=(self.root/relative).resolve()
         if not any(candidate==root or root in candidate.parents for root in self.roots()): raise ValueError('path is outside approved folders')
         if any(part in self.SECRET_NAMES or part.lower().endswith(('.pem','.key')) for part in candidate.parts): raise ValueError('protected credential path denied')
         return candidate
+    def normalize_pdf_args(self,args):
+        source=dict(args or {})
+        def choose(canonical,*aliases):
+            value=source.get(canonical)
+            if value is not None: return value
+            for alias in aliases:
+                if source.get(alias) is not None: return source[alias]
+            return None
+        name=choose('filename','file_name','name') or 'Welcome_to_Xerxes.pdf'
+        destination=choose('destination','location','folder','directory','path') or '.'
+        if isinstance(destination,str) and destination.casefold()=='desktop': destination='desktop'
+        text=choose('text','content')
+        normalized={'filename':name,'destination':destination}
+        if text is not None: normalized['text']=text
+        if source.get('title') is not None: normalized['title']=source['title']
+        return normalized
+    def pdf_target(self,args):
+        normalized=self.normalize_pdf_args(args)
+        name=normalized['filename']
+        if not isinstance(name,str) or Path(name).name!=name or not name.lower().endswith('.pdf') or not re.fullmatch(r'[\w .()\-]+\.pdf',name,re.I): raise ValueError('invalid PDF filename')
+        destination=self.resolve(normalized['destination'])
+        if not destination.is_dir(): raise ValueError('PDF destination folder not found or no longer authorized')
+        return normalized,destination/name
     def check(self,tool,args):
         try:
             if tool in {'list_workspace','search_workspace'}: return Decision(True,'read-only workspace operation')
@@ -27,11 +57,9 @@ class Policy:
                 if len(args['old_text'])>200000 or len(args['new_text'])>200000: raise ValueError('patch exceeds size limit')
                 return Decision(True,'validated workspace patch; explicit approval required')
             if tool=='create_pdf':
-                name=args.get('filename') or 'Welcome_to_Xerxes.pdf'
-                if not isinstance(name,str) or Path(name).name!=name or not name.lower().endswith('.pdf') or not re.fullmatch(r'[\w .()\-]+\.pdf',name,re.I): raise ValueError('invalid PDF filename')
-                target=self.resolve(args.get('destination','.')+'/'+name)
+                normalized,target=self.pdf_target(args)
                 if target.exists(): raise ValueError('destination file already exists')
-                if not isinstance(args.get('text'),str) or not args['text'].strip(): raise ValueError('PDF text is required')
+                if not isinstance(normalized.get('text'),str) or not normalized['text'].strip(): raise ValueError('PDF text is required')
                 return Decision(True,'validated PDF destination; explicit approval required')
             if tool=='run_tests': self.command(args.get('command','')); return Decision(True,'allowlisted non-privileged test command')
             return Decision(False,'tool is not enabled by deterministic policy')
@@ -68,15 +96,18 @@ class Policy:
         base=self.resolve(relative) if relative not in {'.','./'} else None
         if base is not None and not base.is_dir(): raise ValueError('search folder not found or no longer authorized')
         out=[]; roots=[base] if base else self.roots(); seen=set()
-        terms=[term for term in query.lower().split() if term]
+        terms=[term for term in re.split(r'[\s,]+',query.casefold()) if term]
         ignored={'node_modules','.git','dist','.venv','__pycache__','.pytest_cache'}
+        inaccessible_roots=excluded=unauthorized=traversal_errors=0
         for root in roots:
-            if not root.is_dir(): continue
+            if not root.is_dir(): inaccessible_roots+=1; continue
             for p in root.rglob('*'):
-                if any(part.casefold() in ignored for part in p.parts): continue
+                if any(part.casefold() in ignored for part in p.parts): excluded+=1; continue
                 try: resolved=p.resolve(); allowed=any(resolved==r or r in resolved.parents for r in self.roots())
-                except OSError: continue
-                if not allowed or not p.is_file() or resolved in seen or p.suffix.lower() not in {'.py','.js','.jsx','.ts','.tsx','.md','.json','.css','.txt'}: continue
+                except OSError: traversal_errors+=1; continue
+                if not allowed: unauthorized+=1; continue
+                if not p.is_file() or resolved in seen: continue
+                if p.suffix.lower() not in {'.py','.js','.jsx','.ts','.tsx','.md','.json','.css','.txt'}: excluded+=1; continue
                 seen.add(resolved)
                 try:
                     filename=p.name.lower()
@@ -92,6 +123,9 @@ class Policy:
                             except ValueError: display=str(resolved)
                             out.append({'path':display,'line':n,'text':line[:300]})
                 except OSError:
-                    continue
-                if len(out)>=100: return out
+                    traversal_errors+=1; continue
+                if len(out)>=100:
+                    logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d capped=true',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors)
+                    return out
+        logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors)
         return out

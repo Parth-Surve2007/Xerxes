@@ -57,6 +57,13 @@ def execute_task(task_id):
 def cancel_task(task_id):
     try: return jsonify(engine.cancel(task_id))
     except KeyError: return err('task not found',404)
+@app.post('/api/v1/tasks/<task_id>/select')
+def select_task_candidate(task_id):
+    try:
+        payload=request.get_json(silent=True) or {}
+        return jsonify(engine.select_candidate(task_id,payload.get('candidate_id','')))
+    except KeyError: return err('task not found',404)
+    except ValueError as exc: return err(str(exc),403)
 @app.get('/api/v1/tools')
 def tools(): return jsonify({'tools':engine.tool_catalog()})
 @app.get('/api/v1/capabilities')

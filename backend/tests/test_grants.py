@@ -51,6 +51,14 @@ def test_search_finds_nested_file_in_granted_root_and_alias(tmp_path):
     results=policy.search('hihi','desktop',mode='filename')
     assert len(results)==1 and results[0]['path'].endswith('hihi.txt') and results[0]['match']=='filename'
 
+def test_filename_search_tokenizes_comma_variants_and_skips_generated_dirs(tmp_path):
+    workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; nested=desktop/'xerxes'/'nested'; generated=desktop/'node_modules'/'package'; workspace.mkdir(); nested.mkdir(parents=True); generated.mkdir(parents=True)
+    (nested/'Huhu-note.txt').write_text('safe',encoding='utf-8'); (generated/'hihi.txt').write_text('generated',encoding='utf-8')
+    store=GrantStore(tmp_path/'grants.json'); store.add(desktop); policy=Policy(workspace,store)
+    assert policy.resolve('Desktop')==desktop.resolve()
+    results=policy.search('hihi, riri, huhu, hehe, ruru','Desktop',mode='filename')
+    assert len(results)==1 and results[0]['path'].endswith('Huhu-note.txt')
+
 def test_search_stops_after_grant_revocation(tmp_path):
     workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; workspace.mkdir(); desktop.mkdir()
     (desktop/'note.txt').write_text('revocation marker',encoding='utf-8')

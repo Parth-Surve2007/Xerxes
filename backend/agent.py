@@ -4,6 +4,7 @@ from pathlib import Path
 from policy import Policy
 from native_provider import NativeProvider
 from grants import GrantStore
+from capabilities import planner_contract
 MODEL_VERSION='local-adapter-v1'
 class LocalModel:
     def __init__(self):
@@ -50,22 +51,25 @@ class LocalModel:
             return {'state':'ready','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'ollama_url':self.ollama_url}
         except Exception as exc: return {'state':'unavailable','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':True,'reason':type(exc).__name__}
     def plan(self,prompt):
+        contract=json.dumps(planner_contract(),separators=(',',':'))
         if self.native:
             text=self.native.plan(prompt)
             fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',text,re.S)
             candidate=fenced.group(1) if fenced else text
             raw=json.loads(candidate)
             if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: raise ValueError('native model returned invalid action plan')
+            for action in raw['actions']:
+                if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
             allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
             if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): raise ValueError('native model returned unauthorized action')
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf.'},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
+            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
-            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must have tool and arguments. Allowed tools: list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf.'},{'role':'user','content':prompt}]}
+            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}]}
             req=urllib.request.Request(self.ollama_url+'/api/chat',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
         if endpoint:
@@ -73,7 +77,10 @@ class LocalModel:
             fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',content,re.S)
             raw=json.loads(fenced.group(1) if fenced else content)
         else: raw=json.loads(raw.get('message',{}).get('content','{}'))
+        if isinstance(raw,list): raw={'actions':raw}
         if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: return None
+        for action in raw['actions']:
+            if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
         allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
         if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): return None
         return raw
@@ -89,7 +96,7 @@ class RiskClient:
         req=urllib.request.Request(self.url+'/api/v1/risk/score',data=json.dumps(metadata).encode(),headers={'Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req,timeout=5) as res: return json.loads(res.read())
 class AgentEngine:
-    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._init_db()
+    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._init_db()
     def _db(self): c=sqlite3.connect(self.db_path); c.row_factory=sqlite3.Row; return c
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True,exist_ok=True); c=self._db(); c.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,prompt TEXT,data TEXT,created_at TEXT,updated_at TEXT)'); c.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT,timestamp TEXT,action TEXT,arguments TEXT,authorization TEXT,policy_reason TEXT,risk TEXT,result TEXT,exit_code INTEGER,verification TEXT)'); c.commit(); c.close()
@@ -182,7 +189,9 @@ class AgentEngine:
     def _obtain_plan(self,planning_prompt,goal):
         try: plan=self.model.plan(planning_prompt)
         except Exception as exc: return None,f'{type(exc).__name__}: {exc}'
-        if not plan: return None,None
+        if not plan:
+            state=self.model.status().get('state','unknown')
+            return None,f'planner returned no usable action plan (runtime state: {state})'
         try:
             plan=self._normalize_plan(plan,goal); self._validate_plan(plan,goal); return plan,None
         except ValueError as first:
@@ -192,6 +201,11 @@ class AgentEngine:
             except Exception as exc: return None,f'ungrounded plan: {exc}'
     def _validate_plan(self,plan,goal):
         actions=plan.get('actions',[]); lower=goal.lower(); names=[a.get('tool') for a in actions]
+        allowed_args={'list_workspace':set(),'search_workspace':{'query','path','mode'},'read_file':{'path'},'run_tests':{'command'},'apply_patch':{'path','old_text','new_text'},'create_pdf':{'filename','destination','text','title'}}
+        for action in actions:
+            tool=action.get('tool'); args=action.get('arguments',{})
+            if tool not in allowed_args: raise ValueError(f'unsupported tool: {tool}')
+            if not isinstance(args,dict) or any(key not in allowed_args[tool] for key in args): raise ValueError(f'unsupported arguments for {tool}')
         for action in actions:
             if action.get('tool')=='search_workspace':
                 query=action.get('arguments',{}).get('query')
@@ -211,7 +225,12 @@ class AgentEngine:
             if read_index is None or pdf_index is None or read_index>pdf_index: raise ValueError('PDF creation requires a preceding read action')
         if any(self._has_unsupported_reference(a.get('arguments',{})) for a in actions): raise ValueError('plan contains unsupported or unresolved action result reference')
     def _save_task(self,t):
-        t['updated_at']=datetime.now(timezone.utc).isoformat(); c=self._db(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),t['updated_at'],t['id'])); c.commit(); c.close()
+        c=self._db(); row=c.execute('SELECT data FROM tasks WHERE id=?',(t['id'],)).fetchone()
+        if row:
+            current=json.loads(row[0]); terminal={'cancelled','completed','failed','blocked','error'}
+            if current.get('status') in terminal and t.get('status')!=current.get('status'):
+                c.close(); return False
+        t['updated_at']=datetime.now(timezone.utc).isoformat(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),t['updated_at'],t['id'])); c.commit(); c.close(); return True
     @staticmethod
     def _phase(tool): return {'search_workspace':('SEARCHING','Searching approved folders'), 'read_file':('READING FILE','Reading an authorized file'), 'create_pdf':('CREATING PDF','Creating and verifying the approved PDF'), 'apply_patch':('WRITING FILE','Applying an approved file change'), 'list_workspace':('LISTING FILES','Listing approved workspace files'), 'run_tests':('RUNNING TESTS','Running an allowlisted test command')}.get(tool,('EXECUTING','Executing approved action'))
     def _normalize_plan(self,plan,prompt):
@@ -219,11 +238,15 @@ class AgentEngine:
         for index,action in enumerate(plan.get('actions',[])):
             if not isinstance(action,dict): continue
             item=dict(action); args=dict(item.get('arguments') or {})
+            # Capability metadata uses ``name``; persisted/executable plans use
+            # the canonical ``tool`` key. Normalize this model response once.
+            if 'tool' not in item and isinstance(item.get('name'),str): item['tool']=item.pop('name')
             if item.get('tool')=='read_file' and 'path' not in args and 'file_path' in args: args['path']=args.pop('file_path')
-            if item.get('tool')=='create_pdf' and 'text' not in args and 'content' in args: args['text']=args.pop('content')
+            if item.get('tool')=='create_pdf': args=self.policy.normalize_pdf_args(args)
             if item.get('tool')=='search_workspace':
                 if 'query' not in args and 'search_term' in args: args['query']=args.pop('search_term')
                 if 'mode' not in args and args.get('file_types'): args['mode']='filename'
+                args.pop('file_types',None)
             item['id']=item.get('id') or f"{item.get('tool','step')}-{index+1}"; item['arguments']=args; actions.append(item)
         wants_readme='readme' in prompt.lower()
         if wants_readme and not any(a.get('tool')=='read_file' and str(a.get('arguments',{}).get('path','')).lower().endswith('readme.md') for a in actions):
@@ -239,8 +262,17 @@ class AgentEngine:
     @staticmethod
     def _normalize_references(value,by_tool):
         if isinstance(value,str):
-            match=re.fullmatch(r'\{\{([A-Za-z_][\w-]*)_result(?:\.([A-Za-z_][\w-]*))?\}\}',value)
-            if match and match.group(1) in by_tool: return {'$ref':{'step':by_tool[match.group(1)],'field':match.group(2) or 'result'}}
+            reserved={
+                'selected_file_path': ('search_workspace','file_path'),
+                'search_workspace.result': ('search_workspace','result'),
+                'search_workspace.result.file_path': ('search_workspace','file_path'),
+                'read_file.result': ('read_file','result'),
+                'read_file.result.content': ('read_file','content'),
+            }
+            if value in reserved and reserved[value][0] in by_tool:
+                step,field=reserved[value]; return {'$ref':{'step':by_tool[step],'field':field}}
+            match=re.fullmatch(r'\{\{([A-Za-z_][\w-]*)(?:_result|\.result)(?:\.([A-Za-z_][\w-]*))?(?:\.([A-Za-z_][\w-]*))?\}\}',value)
+            if match and match.group(1) in by_tool: return {'$ref':{'step':by_tool[match.group(1)],'field':match.group(3) or match.group(2) or 'result'}}
             return value
         if isinstance(value,dict): return {k:AgentEngine._normalize_references(v,by_tool) for k,v in value.items()}
         if isinstance(value,list): return [AgentEngine._normalize_references(v,by_tool) for v in value]
@@ -275,6 +307,8 @@ class AgentEngine:
         try: risk=self.risk.score(meta)
         except Exception as exc: risk={'state':'unavailable','reason':type(exc).__name__}
         if not d.allowed: self._audit(tid,name,args,'denied',d.reason,risk,verification='not_run'); return {'tool':name,'status':'blocked','reason':d.reason,'risk':risk}
+        if name in {'apply_patch','create_pdf'} and self._cancelled(tid):
+            return {'tool':name,'status':'blocked','reason':'task was cancelled before filesystem write'}
         if name=='list_workspace': result=self.policy.list_tree()
         elif name=='read_file': result=self.policy.read_file(args.get('path',''))
         elif name=='search_workspace': result=self.policy.search(args.get('query',''),args.get('path','.') or '.',args.get('mode','content'))
@@ -282,9 +316,9 @@ class AgentEngine:
             proc=subprocess.run(self.policy.command(args.get('command','')),cwd=self.workspace,capture_output=True,text=True,timeout=60,shell=False); result={'stdout':proc.stdout[-12000:],'stderr':proc.stderr[-12000:],'exit_code':proc.returncode}; self._audit(tid,name,args,'allowed',d.reason,risk,result,proc.returncode,'passed' if proc.returncode==0 else 'failed'); return {'tool':name,'status':'completed' if proc.returncode==0 else 'failed','result':result,'risk':risk}
         elif name=='create_pdf':
             from pdf_generator import create_pdf
-            destination=self.policy.resolve((args.get('destination') or '.')+'/'+(args.get('filename') or 'Welcome_to_Xerxes.pdf'))
+            normalized,destination=self.policy.pdf_target(args)
             if destination.exists(): raise FileExistsError('destination file already exists')
-            result=create_pdf(destination,args.get('text',''),args.get('title'))
+            result=create_pdf(destination,normalized.get('text',''),normalized.get('title'))
         elif name=='apply_patch':
             path=self.policy.resolve(args['path']); before=path.read_text(encoding='utf-8'); old=args['old_text']; new=args['new_text']
             if before.count(old)!=1: raise ValueError('patch context must match exactly once')
@@ -301,6 +335,8 @@ class AgentEngine:
             if not isinstance(data,dict) or field not in data:
                 if field in {'file_path','path'} and isinstance(data,list):
                     paths=[x.get('path') for x in data if isinstance(x,dict) and x.get('path')]
+                    selected=self._current_selected_path
+                    if selected and selected in paths: return selected
                     if len(paths)==1: return paths[0]
                     if not paths: raise ValueError(f"dependency {ref.get('step')} returned no usable file")
                     raise ValueError(f"dependency {ref.get('step')} returned multiple candidates; user selection is required")
@@ -315,17 +351,26 @@ class AgentEngine:
         if isinstance(value,dict): return any(AgentEngine._has_placeholder(v) for v in value.values())
         if isinstance(value,list): return any(AgentEngine._has_placeholder(v) for v in value)
         return False
+    def _cancelled(self,tid):
+        current=self._get(tid)
+        return not current or current.get('status')=='cancelled'
     def execute(self,tid,approve=False):
         t=self._get(tid)
         if not t: raise KeyError(tid)
+        if t.get('status')=='awaiting_input': raise ValueError('a candidate selection is required before execution')
+        self._current_selected_path=t.get('selected_candidate',{}).get('path') if isinstance(t.get('selected_candidate'),dict) else None
+        if self._cancelled(tid): return self._get(tid) or t
         prior_results=t.get('results',[]) if t.get('status')=='approval_required' and approve else []
         t['status']='executing'; t['phase']='EXECUTING'; t['message']='Starting approved actions.'; t['current_action']=None; t['completed_steps']=sum(1 for r in prior_results if r.get('status')=='completed'); t['total_steps']=len(t['plan'].get('actions',[])); t['results']=prior_results; self._save_task(t)
         if not t['plan'].get('actions') and t['plan'].get('mode')=='diagnostic':
             t['status']='blocked'; t['phase']='ERROR'; t['message']='Intelligent planning is unavailable; no safe task-specific action was derived.'; self._save_task(t); return t
-        for raw_action in t['plan'].get('actions',[]):
+        action_index=0
+        while action_index < len(t['plan'].get('actions',[])):
+            raw_action=t['plan']['actions'][action_index]; action_index+=1
+            if self._cancelled(tid): return self._get(tid) or t
             a=dict(raw_action); args=dict(a.get('arguments') or {})
             if any(r.get('id')==a.get('id') and r.get('status')=='completed' for r in t['results']): continue
-            if a.get('tool')=='create_pdf' and 'text' not in args and 'content' in args: args['text']=args.pop('content')
+            if a.get('tool')=='create_pdf': args=self.policy.normalize_pdf_args(args)
             if a.get('tool')=='read_file' and 'path' not in args and 'file_path' in args: args['path']=args.pop('file_path')
             if a.get('tool')=='search_workspace' and 'query' not in args and 'search_term' in args: args['query']=args.pop('search_term')
             if a.get('tool')=='search_workspace' and 'mode' not in args and args.get('file_types'): args['mode']='filename'
@@ -333,28 +378,68 @@ class AgentEngine:
             except ValueError as exc:
                 blocked={'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':str(exc)}; t['results'].append(blocked); t['status']='blocked'; t['phase']='ERROR'; t['message']=str(exc); self._save_task(t); break
             a['arguments']=args
-            if a.get('tool') in {'apply_patch','create_pdf'} and not approve: t['results'].append({'tool':a.get('tool'),'status':'approval_required'}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before writing files.'; self._save_task(t); break
+            if a.get('tool') in {'apply_patch','create_pdf'}:
+                if self._cancelled(tid): return self._get(tid) or t
+                decision=self.policy.check(a.get('tool'),args)
+                if not decision.allowed:
+                    t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':decision.reason}); t['status']='blocked'; t['phase']='ERROR'; t['message']=decision.reason; self._save_task(t); break
+                if not approve:
+                    t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'approval_required','arguments':args}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before writing files.'; self._save_task(t); break
             if a.get('tool')=='create_pdf' and 'readme' in t.get('prompt','').lower():
                 read_results=[r.get('result') for r in t['results'] if r.get('tool')=='read_file' and r.get('status')=='completed']
                 if not read_results: t['status']='blocked'; t['results'].append({'tool':'create_pdf','status':'blocked','reason':'README content was not read; PDF was not created'}); break
                 args=dict(a.get('arguments') or {}); welcome=re.split(r'copy contents',t['prompt'],maxsplit=1,flags=re.I)[0].strip(' ,.')
                 args['text']=welcome+'\n\n'+read_results[-1]['content']; a={**a,'arguments':args}
             t['phase'],t['message']=self._phase(a.get('tool')); t['current_action']=a.get('tool'); self._save_task(t)
-            result=self._run(tid,a); result['id']=a.get('id'); t['results'].append(result)
+            try:
+                result=self._run(tid,a); result['id']=a.get('id')
+            except Exception as exc:
+                current=self._get(tid)
+                if current and current.get('status')=='cancelled': return current
+                result={'id':a.get('id'),'tool':a.get('tool'),'status':'failed','reason':f'{type(exc).__name__}: {str(exc)[:240]}'}
+            current=self._get(tid)
+            if not current: return t
+            if current.get('status')=='cancelled':
+                if not any(item.get('id')==result.get('id') for item in current.get('results',[])):
+                    current.setdefault('results',[]).append(result)
+                    if result.get('status')=='completed': current['completed_steps']=sum(1 for item in current['results'] if item.get('status')=='completed')
+                    self._save_task(current)
+                return self._get(tid) or current
+            t=current; t['results'].append(result)
             if t['results'][-1]['status'] in {'blocked','failed'}: t['status']=t['results'][-1]['status']; t['phase']='ERROR'; t['message']=t['results'][-1].get('reason','Action failed'); self._save_task(t); break
             t['completed_steps']+=1; self._save_task(t)
+            if self._cancelled(tid): return self._get(tid) or t
             if a.get('tool')=='search_workspace' and t.get('plan',{}).get('mode')=='diagnostic':
                 matches=(result.get('result') or [])
                 if not matches:
                     t['status']='blocked'; t['phase']='ERROR'; t['message']='No matching files were found; provide a more precise filename or search clue.'; self._save_task(t); break
                 if len(matches)>1:
+                    t['candidates']=[{'id':f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
                     t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
                 selected=matches[0].get('path')
                 if selected:
                     self._append_dependent_actions(t,selected); self._save_task(t)
+            elif a.get('tool')=='search_workspace':
+                matches=(result.get('result') or [])
+                if len(matches)>1:
+                    t['candidates']=[{'id':f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
+                    t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
         else: t['status']='completed'; t['phase']='COMPLETED'; t['message']='All actions completed successfully.'; t['current_action']=None; self._save_task(t)
+        self._current_selected_path=None
         return t
+    def select_candidate(self,tid,candidate_id):
+        t=self._get(tid)
+        if not t: raise KeyError(tid)
+        if t.get('status')!='awaiting_input': raise ValueError('task is not waiting for file selection')
+        candidate=next((item for item in t.get('candidates',[]) if item.get('id')==candidate_id),None)
+        if not candidate: raise ValueError('candidate is not present in this task')
+        path=candidate.get('path'); resolved=self.policy.resolve(path)
+        if not resolved.is_file(): raise ValueError('selected candidate is no longer an accessible file')
+        t['selected_candidate']={'id':candidate_id,'path':path}; t['status']='planned'; t['phase']='WAITING FOR EXECUTION'; t['message']='Candidate selected; execute the remaining authorized steps when ready.'
+        if t.get('plan',{}).get('mode')=='diagnostic': self._append_dependent_actions(t,path)
+        self._save_task(t); return t
     def cancel(self,tid):
         t=self._get(tid)
         if not t: raise KeyError(tid)
+        if t.get('status') in {'completed','failed','blocked','error','cancelled'}: return t
         t['status']='cancelled'; t['phase']='CANCELLED'; t['message']='Task cancelled by user.'; self._save_task(t); self._audit(tid,'cancel',{},'allowed','user cancellation',verification='verified'); return t
