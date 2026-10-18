@@ -5,6 +5,7 @@ from policy import Policy
 from native_provider import NativeProvider
 from grants import GrantStore
 from capabilities import available_capabilities, capability, parse_response_text, planner_prompt, validate_arguments
+from risk_client import RiskClient
 MODEL_VERSION='local-adapter-v1'
 class LocalModel:
     def __init__(self):
@@ -118,17 +119,6 @@ class LocalModel:
         allowed={item['name'] for item in available_capabilities()}
         if any(a.get('tool') not in allowed for a in raw.get('actions',[])): raise ValueError('model returned an unauthorized capability')
         return raw
-class RiskClient:
-    def __init__(self): self.url=os.environ.get('XERXES_RISK_URL','').rstrip('/')
-    def status(self):
-        if not self.url: return {'state':'unconfigured','url':None}
-        try:
-            with urllib.request.urlopen(self.url+'/api/v1/health',timeout=3) as res: return {'state':'ready',**json.loads(res.read())}
-        except Exception as exc: return {'state':'unavailable','reason':type(exc).__name__}
-    def score(self,metadata):
-        if not self.url: return None
-        req=urllib.request.Request(self.url+'/api/v1/risk/score',data=json.dumps(metadata).encode(),headers={'Content-Type':'application/json'},method='POST')
-        with urllib.request.urlopen(req,timeout=5) as res: return json.loads(res.read())
 class AgentEngine:
     def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.workspace_active=True; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._init_db()
     def _db(self): c=sqlite3.connect(self.db_path); c.row_factory=sqlite3.Row; return c
