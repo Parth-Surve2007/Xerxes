@@ -157,12 +157,19 @@ Only set variables needed for the environment. Empty or absent workspace configu
 | `XERXES_LLAMA_SERVER_PORT` | Managed llama.cpp server port; defaults to `56322`. |
 | `XERXES_RUNTIME_SETTINGS` | Runtime settings JSON path. |
 | `XERXES_GPU_MODE` | `cpu` or `cuda`. |
-| `XERXES_GPU_LAYERS` | Requested llama.cpp GPU layer count; defaults to `12`. |
+| `XERXES_GPU_LAYERS` | Requested llama.cpp GPU layer count; defaults to `16` for the verified RTX 3050 profile. |
 | `XERXES_OLLAMA_URL` | Ollama-compatible endpoint; defaults to `http://127.0.0.1:11434`. |
 | `XERXES_NATIVE_DLL` / `XERXES_NATIVE_RUNTIME_DIR` / `XERXES_NATIVE_THREADS` | Optional native-provider settings. |
 | `XERXES_RISK_URL` | Direct risk-service URL. |
 | `XERXES_LINUXONE_SSH_HOST` / `XERXES_LINUXONE_SSH_USER` / `XERXES_LINUXONE_SSH_KEY` | Managed SSH-tunnel connection settings. |
 | `XERXES_LINUXONE_REMOTE_PORT` / `XERXES_LINUXONE_LOCAL_PORT` | Remote and local tunnel ports; both default to `5001`. |
+
+LinuxONE connection settings may also be stored outside the repository in
+`%LOCALAPPDATA%\Xerxes\linuxone.json` (or the directory named by
+`XERXES_CONFIG_DIR`). Process environment variables take precedence over this
+file. The file contains connection metadata only; keep the private key in its
+separate external path. The backend reports the selected source and missing
+field names without returning configuration values.
 | `XERXES_GRANT_TOKEN` | Token used by protected folder-grant endpoints. |
 | `XERXES_VERIFICATION_TOKEN` | Token for the local verification prototype. |
 | `VITE_API_BASE_URL` | Browser renderer API base override when not using the Electron bridge. |
@@ -175,9 +182,9 @@ Planner failure is not treated as permission to guess. Xerxes records an actiona
 
 ## GPU acceleration
 
-The runtime exposes requested mode, effective mode, configured layers, observed offload evidence, process ID, and the last inference in the health/runtime response. On the development machine, CUDA offload was live-verified with the managed llama.cpp runtime and a Qwen2.5 GGUF model. This evidence is machine- and model-dependent; `XERXES_GPU_LAYERS=12` is a default request, not a guarantee that every model will offload exactly that many layers.
+The runtime exposes requested mode, effective mode, configured layers, observed offload evidence, process ID, and the last inference in the health/runtime response. On the development machine, CUDA offload was live-verified with the managed llama.cpp runtime and a Qwen2.5 GGUF model. This evidence is machine- and model-dependent; `XERXES_GPU_LAYERS=16` is a default request, not a guarantee that every model will offload exactly that many layers.
 
-CPU fallback remains supported. A runtime can report CUDA requested but CPU effective if the executable, driver, model, or launch configuration cannot provide verified offload. Per-process NVIDIA utilization may be unavailable even when llama.cpp log evidence confirms offload.
+CPU fallback remains supported. A runtime can report CUDA requested but CPU effective if the executable, driver, model, or launch configuration cannot provide verified offload. Per-process NVIDIA utilization may be unavailable even when llama.cpp log evidence confirms offload. On the verified RTX 3050 4 GB profile, 16 layers is the default tested balance; set `XERXES_GPU_LAYERS=12` to retain the lower-memory setting or use another explicit value only after testing it on the target machine.
 
 ## Workspaces, files, and PDFs
 

@@ -13,7 +13,9 @@ class Policy:
     ALLOWED_COMMANDS={'pytest backend/tests -q':[sys.executable,'-m','pytest','backend/tests','-q'],'npm run build':[('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],'python -m pytest backend/tests -q':[sys.executable,'-m','pytest','backend/tests','-q']}
     EXCLUDED_DIRS={'.git','node_modules','dist','build','intermediates','.venv','venv','__pycache__','.pytest_cache','.mypy_cache','.ruff_cache','.tox','.next','coverage'}
     TEXT_EXTENSIONS={'.py','.js','.jsx','.ts','.tsx','.md','.json','.css','.txt'}
-    def __init__(self,root,grants=None): self.root=Path(root).resolve(); self.grants=grants
+    SEARCH_MAX_DIRECTORIES=5000
+    SEARCH_MAX_FILES=20000
+    def __init__(self,root,grants=None): self.root=Path(root).resolve(); self.grants=grants; self.last_search_info={}
     def roots(self): return [self.root]+[Path(x['path']).resolve() for x in (self.grants.list() if self.grants else [])]
     def desktop_root(self):
         desktops=[root for root in self.roots() if root.name.casefold()=='desktop']
@@ -130,18 +132,30 @@ class Policy:
         out=[]; roots=[base] if base else self.roots(); seen=set()
         terms=[term.casefold() for term in re.findall(r'[\w.-]+',query,flags=re.UNICODE) if term]
         ignored={name.casefold() for name in self.EXCLUDED_DIRS}
-        inaccessible_roots=excluded=unauthorized=traversal_errors=0
+        inaccessible_roots=excluded=unauthorized=traversal_errors=0; visited_directories=visited_files=0; capped=False
+        is_junction=getattr(os.path,'isjunction',lambda _path:False)
+        def onerror(_error):
+            nonlocal traversal_errors
+            traversal_errors+=1
         for root in roots:
             if not root.is_dir(): inaccessible_roots+=1; continue
-            for current, directories, filenames in os.walk(root, topdown=True):
-                directories[:]=[name for name in directories if name.casefold() not in ignored]
+            for current, directories, filenames in os.walk(root, topdown=True, followlinks=False, onerror=onerror):
+                visited_directories+=1
+                if visited_directories>self.SEARCH_MAX_DIRECTORIES:
+                    capped=True; break
+                directories[:]=[name for name in directories if name.casefold() not in ignored and not (Path(current)/name).is_symlink() and not is_junction(Path(current)/name)]
                 for filename in filenames:
+                    visited_files+=1
+                    if visited_files>self.SEARCH_MAX_FILES:
+                        capped=True; break
                     p=Path(current)/filename
                     try: resolved=p.resolve(); allowed=any(resolved==r or r in resolved.parents for r in self.roots())
                     except OSError: traversal_errors+=1; continue
                     if not allowed: unauthorized+=1; continue
                     if resolved in seen: continue
-                    if p.suffix.lower() not in self.TEXT_EXTENSIONS: excluded+=1; continue
+                    # Filename discovery must also find extensionless and non-text files.
+                    # Content search remains restricted to bounded, decodable text files.
+                    if mode!='filename' and p.suffix.lower() not in self.TEXT_EXTENSIONS: excluded+=1; continue
                     seen.add(resolved)
                     try:
                         filename=p.name.casefold()
@@ -162,8 +176,13 @@ class Policy:
                     except OSError:
                         traversal_errors+=1; continue
                     if len(out)>=100:
-                        logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d capped=true',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors)
+                        capped=True
+                        self.last_search_info={'mode':mode,'roots':len(roots),'visited_directories':visited_directories,'visited_files':visited_files,'inaccessible_roots':inaccessible_roots,'matches':len(out),'excluded':excluded,'unauthorized':unauthorized,'traversal_errors':traversal_errors,'capped':True}
+                        logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d visited_directories=%d visited_files=%d capped=true',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors,visited_directories,visited_files)
                         return out
+                if capped: break
+            if capped: break
         if mode=='filename': out.sort(key=lambda item:(-item.get('score',0),item['path'].casefold()))
-        logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors)
+        self.last_search_info={'mode':mode,'roots':len(roots),'visited_directories':visited_directories,'visited_files':visited_files,'inaccessible_roots':inaccessible_roots,'matches':len(out),'excluded':excluded,'unauthorized':unauthorized,'traversal_errors':traversal_errors,'capped':capped}
+        logger.info('search_workspace mode=%s roots=%d inaccessible_roots=%d matches=%d excluded=%d unauthorized=%d traversal_errors=%d visited_directories=%d visited_files=%d capped=%s',mode,len(roots),inaccessible_roots,len(out),excluded,unauthorized,traversal_errors,visited_directories,visited_files,capped)
         return out

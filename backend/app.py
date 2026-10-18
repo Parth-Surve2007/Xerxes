@@ -15,6 +15,16 @@ MAX_TASK_PROMPT=32*1024
 def err(message,code=400): return jsonify({'error':{'message':message}}),code
 @app.get('/api/v1/health')
 def health(): return jsonify({'status':'ok','product':'xerxes','architecture':platform.machine(),'workspace':str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None,'model':engine.model.status(),'risk_service':engine.risk.status()})
+@app.post('/api/v1/linuxone/connect')
+def linuxone_connect(): return jsonify(engine.risk.connect())
+@app.post('/api/v1/linuxone/disconnect')
+def linuxone_disconnect(): return jsonify(engine.risk.disconnect())
+@app.get('/api/v1/linuxone/config')
+def linuxone_config(): return jsonify(engine.risk.diagnostics())
+@app.post('/api/v1/linuxone/config')
+def save_linuxone_config():
+    try: return jsonify(engine.risk.save_config(request.get_json(silent=True) or {}))
+    except ValueError as exc: return err(str(exc),400)
 @app.get('/api/v1/settings')
 def settings():
     data=engine.settings(); data['workspace']=str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None; return jsonify(data)
@@ -46,11 +56,13 @@ def set_workspace():
 def create_task():
     payload=request.get_json(silent=True) or {}
     prompt=payload.get('prompt','')
+    session_id=payload.get('session_id')
+    if session_id is not None and not isinstance(session_id,str): return err('session_id must be text')
     if not isinstance(prompt,str): return err('prompt must be text')
     prompt=prompt.strip()
     if not prompt: return err('prompt is required')
     if len(prompt)>MAX_TASK_PROMPT: return err(f'prompt exceeds the {MAX_TASK_PROMPT}-character task limit')
-    try: return jsonify(engine.start_task(prompt)),202
+    try: return jsonify(engine.start_task(prompt,session_id=session_id)),202
     except (RuntimeError, ValueError) as exc: return err(str(exc),503 if isinstance(exc,RuntimeError) else 422)
 @app.get('/api/v1/tasks/<task_id>')
 def get_task(task_id):

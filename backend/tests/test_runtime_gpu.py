@@ -1,5 +1,6 @@
 import json
 import sys
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -54,6 +55,29 @@ def test_cpu_mode_reports_no_effective_gpu_offload(tmp_path, monkeypatch):
     assert status["backend_type"] == "cpu"
     assert status["gpu_layers"] == 0
     assert status["gpu_offload_verified"] is False
+
+def test_managed_status_requires_http_health_not_process_liveness(tmp_path, monkeypatch):
+    monkeypatch.setenv("XERXES_LLAMA_SERVER_EXE", "llama-server.exe")
+    monkeypatch.setenv("XERXES_LOCAL_MODEL_PATH", "model.gguf")
+    model = AgentEngine(tmp_path, str(tmp_path / "agent.db")).model
+    class Running:
+        pid = 4242
+        def poll(self): return None
+        def terminate(self): pass
+    model.process = Running()
+    monkeypatch.setattr(model, "_server_health", lambda *args, **kwargs: False)
+    status = model.status()
+    assert status["state"] == "starting"
+    assert status["backend_type"] == "cpu"
+    assert status["gpu_offload_verified"] is False
+
+def test_direct_planner_endpoint_is_health_gated(tmp_path, monkeypatch):
+    monkeypatch.setenv("XERXES_LOCAL_MODEL_URL", "http://127.0.0.1:56322")
+    model = AgentEngine(tmp_path, str(tmp_path / "agent.db")).model
+    monkeypatch.setattr(model, "_server_health", lambda *args, **kwargs: False)
+    assert model.status()["state"] == "unavailable"
+    with pytest.raises(RuntimeError, match="endpoint is unreachable"):
+        model.plan("list files")
 
 
 def test_mode_change_while_server_is_running_is_pending(monkeypatch, tmp_path):

@@ -45,8 +45,8 @@ async function startBackend() {
   const useCuda = requestedGpuMode() === 'cuda' && fs.existsSync(path.join(cudaRuntime, 'llama-server.exe'));
   const runtimeDir = useCuda ? cudaRuntime : cpuRuntime;
   const llamaServer = path.join(runtimeDir, 'llama-server.exe');
-  const runtimeEnv = {...process.env, PORT: String(apiPort), XERXES_WORKSPACE: workspace, XERXES_DATABASE: database, XERXES_RUNTIME_SETTINGS: runtimeSettingsPath(), XERXES_GRANT_TOKEN: grantToken,
-    ...(useCuda ? {XERXES_GPU_MODE:'cuda', XERXES_GPU_LAYERS:process.env.XERXES_GPU_LAYERS || '12', PATH:`${cudaRuntime};${process.env.PATH || ''}`} : {XERXES_GPU_MODE:'cpu'}),
+  const runtimeEnv = {...process.env, PORT: String(apiPort), XERXES_WORKSPACE: workspace, XERXES_DATABASE: database, XERXES_CONFIG_DIR: app.getPath('userData'), XERXES_RUNTIME_SETTINGS: runtimeSettingsPath(), XERXES_GRANT_TOKEN: grantToken,
+    ...(useCuda ? {XERXES_GPU_MODE:'cuda', XERXES_GPU_LAYERS:process.env.XERXES_GPU_LAYERS || '16', PATH:`${cudaRuntime};${process.env.PATH || ''}`} : {XERXES_GPU_MODE:'cpu'}),
     ...(fs.existsSync(localModel) && fs.existsSync(llamaServer) ? {XERXES_LLAMA_SERVER_EXE: llamaServer, XERXES_LOCAL_MODEL_PATH: localModel, XERXES_LOCAL_MODEL:'qwen2.5-coder-7b-instruct-q4_k_m'} : {})};
   backend = spawn(python, ['app.py'], {
     cwd: root,

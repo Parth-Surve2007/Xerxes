@@ -59,6 +59,38 @@ def test_filename_search_tokenizes_comma_variants_and_skips_generated_dirs(tmp_p
     results=policy.search('hihi, riri, huhu, hehe, ruru','Desktop',mode='filename')
     assert len(results)==1 and results[0]['path'].endswith('Huhu-note.txt')
 
+def test_filename_search_finds_extensionless_hidden_candidate(tmp_path):
+    workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; nested=desktop/'nested'; workspace.mkdir(); nested.mkdir(parents=True)
+    target=nested/'mimi'; target.write_text('hidden candidate contents',encoding='utf-8')
+    store=GrantStore(tmp_path/'grants.json'); store.add(desktop); policy=Policy(workspace,store)
+    results=policy.search('hehe huhu riri mimi','Desktop',mode='filename')
+    assert len(results)==1 and Path(results[0]['path']).name=='mimi'
+
+def test_filename_search_finds_windows_hidden_candidate_when_supported(tmp_path):
+    if not sys.platform.startswith('win'):
+        pytest.skip('Windows hidden-file attributes are platform-specific')
+    import ctypes
+    workspace=tmp_path/'workspace'; workspace.mkdir(); target=workspace/'mimi.txt'; target.write_text('hidden',encoding='utf-8')
+    set_attributes=ctypes.windll.kernel32.SetFileAttributesW
+    set_attributes.argtypes=[ctypes.c_wchar_p,ctypes.c_uint32]; set_attributes.restype=ctypes.c_int
+    if not set_attributes(str(target),2):
+        pytest.skip('Windows hidden-file attribute is unavailable')
+    try:
+        results=Policy(workspace).search('mimi',mode='filename')
+        assert len(results)==1 and Path(results[0]['path']).name=='mimi.txt'
+    finally:
+        set_attributes(str(target),0)
+
+def test_search_reports_a_traversal_limit_without_leaving_authorized_root(tmp_path):
+    workspace=tmp_path/'workspace'; workspace.mkdir()
+    for index in range(3):
+        folder=workspace/f'folder-{index}'; folder.mkdir(); (folder/'candidate.txt').write_text('x',encoding='utf-8')
+    policy=Policy(workspace); policy.SEARCH_MAX_DIRECTORIES=2
+    results=policy.search('candidate','.',mode='filename')
+    assert policy.last_search_info['capped'] is True
+    assert policy.last_search_info['visited_directories'] == 3
+    assert all(policy.resolve(item['path']).is_relative_to(workspace) for item in results)
+
 def test_search_stops_after_grant_revocation(tmp_path):
     workspace=tmp_path/'workspace'; desktop=tmp_path/'Desktop'; workspace.mkdir(); desktop.mkdir()
     (desktop/'note.txt').write_text('revocation marker',encoding='utf-8')

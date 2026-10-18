@@ -98,6 +98,29 @@ def test_source_pdf_reads_real_source_and_writes_grounded_pdf(tmp_path):
     assert "SOURCE-PDF-DISTINCTIVE-TEXT" in pdf_text(output)
 
 
+def test_hidden_candidate_search_read_pdf_and_readback_workflow(tmp_path):
+    workspace = tmp_path / "workspace"
+    desktop = tmp_path / "Desktop"
+    target = desktop / "nested" / "mimi"
+    workspace.mkdir(); target.parent.mkdir(parents=True)
+    target.write_text("MIMI-HIDDEN-SOURCE-CONTENT", encoding="utf-8")
+    e = engine(workspace)
+    e.grants.add(desktop)
+    task = planned(e, "Find mimi inside Desktop, read it, and create a PDF on Desktop", [
+        {"id": "search", "tool": "search_workspace", "arguments": {"path": "Desktop", "query": "hehe huhu riri mimi", "mode": "filename"}},
+        {"id": "read", "tool": "read_file", "arguments": {"path": {"$ref": {"step": "search", "field": "path"}}}},
+        {"id": "pdf", "tool": "create_pdf", "arguments": {"filename": "mimi-contents.pdf", "destination": "Desktop", "text": {"$ref": {"step": "read", "field": "content"}}}},
+    ])
+    pending = e.execute(task["id"])
+    assert pending["status"] == "approval_required"
+    assert Path(pending["results"][0]["result"][0]["path"]).name == "mimi"
+    assert pending["results"][1]["result"]["content"] == "MIMI-HIDDEN-SOURCE-CONTENT"
+    done = e.execute(task["id"], approve=True)
+    output = desktop / "mimi-contents.pdf"
+    assert done["status"] == "completed" and output.is_file()
+    assert "MIMI-HIDDEN-SOURCE-CONTENT" in pdf_text(output)
+
+
 def test_zero_search_results_do_not_invent_candidate_or_run_read(tmp_path):
     e = engine(tmp_path)
     task = planned(e, "find missing file and read it", [{"id": "search", "tool": "search_workspace", "arguments": {"query": "does-not-exist.txt", "mode": "filename"}}, {"id": "read", "tool": "read_file", "arguments": {"path": {"$ref": {"step": "search", "field": "path"}}}}])

@@ -1,4 +1,4 @@
-import atexit, difflib, json, os, re, socket, sqlite3, subprocess, urllib.request, uuid, time, threading
+import atexit, difflib, hashlib, json, os, re, socket, sqlite3, subprocess, urllib.request, uuid, time, threading
 from datetime import datetime,timezone
 from pathlib import Path
 from policy import Policy
@@ -14,9 +14,13 @@ class LocalModel:
         self.server_exe=os.environ.get('XERXES_LLAMA_SERVER_EXE','').strip()
         self.model_path=os.environ.get('XERXES_LOCAL_MODEL_PATH','').strip()
         self.server_host='127.0.0.1'; self.server_port=int(os.environ.get('XERXES_LLAMA_SERVER_PORT','56322')); self.process=None
+        try: self.server_ready_timeout=max(5.0,min(180.0,float(os.environ.get('XERXES_LLAMA_READY_TIMEOUT','90'))))
+        except (TypeError,ValueError): self.server_ready_timeout=90.0
+        try: self.inference_timeout=max(5.0,min(180.0,float(os.environ.get('XERXES_MODEL_TIMEOUT','60'))))
+        except (TypeError,ValueError): self.inference_timeout=60.0
         self.settings_path=Path(os.environ.get('XERXES_RUNTIME_SETTINGS','')).expanduser() if os.environ.get('XERXES_RUNTIME_SETTINGS') else None
         self.gpu_mode=self._load_gpu_mode(os.environ.get('XERXES_GPU_MODE','cpu'))
-        self.gpu_layers=max(0,int(os.environ.get('XERXES_GPU_LAYERS','12')))
+        self.gpu_layers=max(0,int(os.environ.get('XERXES_GPU_LAYERS','16')))
         self.ollama_url=os.environ.get('XERXES_OLLAMA_URL','http://127.0.0.1:11434').rstrip('/')
         self.name=os.environ.get('XERXES_LOCAL_MODEL','qwen2.5-coder:1.5b'); self.effective_gpu_mode=None; self.pending_gpu_mode=None; self._log_lines=[]; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None; self._log_lock=threading.Lock()
         atexit.register(self.stop)
@@ -45,23 +49,38 @@ class LocalModel:
                 layer=self.parse_gpu_layer_log(line)
                 if layer is not None:
                     self._gpu_layer_ids.add(layer); self._gpu_layers_offloaded=len(self._gpu_layer_ids); self._offload_evidence.append(line); self._offload_evidence=self._offload_evidence[-20:]
+    def _server_health(self, url=None, timeout=2):
+        try:
+            with urllib.request.urlopen((url or self._server_url())+'/health',timeout=timeout) as res:
+                return res.status==200
+        except Exception:
+            return False
+    def _server_diagnostic(self):
+        with self._log_lock:
+            return '\n'.join(self._log_lines[-20:])[-2000:]
     def _ensure_server(self):
-        if self.url: return self.url.rstrip('/')
+        if self.url:
+            if self._server_health(self.url,timeout=2): return self.url.rstrip('/')
+            raise RuntimeError('configured llama.cpp inference endpoint is unreachable')
         if not (self.server_exe and self.model_path): return ''
-        if self.process and self.process.poll() is None: return self._server_url()
-        args=self._server_args()
-        self.process=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=str(Path(self.server_exe).parent))
-        threading.Thread(target=self._capture_stream,args=(self.process.stdout,),daemon=True).start()
-        threading.Thread(target=self._capture_stream,args=(self.process.stderr,),daemon=True).start()
-        for _ in range(90):
+        if not (self.process and self.process.poll() is None):
+            args=self._server_args()
             try:
-                with urllib.request.urlopen(self._server_url()+'/health',timeout=2) as res:
-                    if res.status==200: self.effective_gpu_mode=self.gpu_mode; return self._server_url()
-            except Exception: pass
-            if self.process.poll() is not None: break
-            import time; time.sleep(1)
-        error=self.process.stderr.read(4000).decode(errors='replace') if self.process else ''
-        self.stop(); raise RuntimeError(f'llama-server failed to become ready: {error[-1000:]}')
+                self.process=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=str(Path(self.server_exe).parent))
+            except OSError as exc:
+                raise RuntimeError(f'llama-server could not start: {type(exc).__name__}: {exc}') from exc
+            threading.Thread(target=self._capture_stream,args=(self.process.stdout,),daemon=True).start()
+            threading.Thread(target=self._capture_stream,args=(self.process.stderr,),daemon=True).start()
+        deadline=time.monotonic()+self.server_ready_timeout
+        while time.monotonic()<deadline:
+            if self._server_health(self._server_url(),timeout=2):
+                self.effective_gpu_mode=self.gpu_mode; return self._server_url()
+            if self.process and self.process.poll() is not None: break
+            time.sleep(.25)
+        diagnostic=self._server_diagnostic(); exit_code=self.process.poll() if self.process else None
+        self.stop(); suffix=f'; exit code {exit_code}' if exit_code is not None else ''
+        if diagnostic: suffix+=f'; logs: {diagnostic}'
+        raise RuntimeError(f'llama-server failed to become ready within {self.server_ready_timeout:g}s{suffix}')
     def set_gpu_mode(self, enabled):
         mode='cuda' if bool(enabled) else 'cpu'
         if self.settings_path:
@@ -76,51 +95,66 @@ class LocalModel:
         self.process=None; self.effective_gpu_mode=None; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None
     def status(self):
         if self.native: return self.native.status()
-        if self.url: return {'state':'ready','provider':'llama.cpp-openai','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'url':self.url,'gpu_mode':self.gpu_mode}
+        if self.url:
+            reachable=self._server_health(self.url,timeout=.5)
+            return {'state':'ready' if reachable else 'unavailable','provider':'llama.cpp-openai','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'url':self.url,'gpu_mode':self.gpu_mode,'reason':None if reachable else 'inference endpoint is unreachable'}
         if self.server_exe and self.model_path:
             running=bool(self.process and self.process.poll() is None)
+            reachable=bool(running and self._server_health(self._server_url(),timeout=.5))
             offloaded=self._gpu_layers_offloaded if running else None
-            verified=bool(running and self.gpu_mode=='cuda' and offloaded and offloaded>0 and self._last_inference and self._last_inference.get('status')=='completed')
-            effective=self.effective_gpu_mode if running else ('cpu' if self.gpu_mode=='cpu' else None)
+            verified=bool(reachable and self.gpu_mode=='cuda' and offloaded and offloaded>0 and self._last_inference and self._last_inference.get('status')=='completed')
+            effective=self.effective_gpu_mode if reachable else ('cpu' if self.gpu_mode=='cpu' else None)
             evidence=self._offload_evidence[-3:]
-            return {'state':'ready' if running else 'configured','provider':'llama.cpp-openai','model':self.model_path,'version':MODEL_VERSION,'diagnostic_mode':False,'server':'managed-lazy','gpu_mode':self.gpu_mode,'effective_gpu_mode':effective,'gpu_layers':self.gpu_layers if effective=='cuda' else 0,'gpu_acceleration_requested':self.gpu_mode=='cuda','backend_type':'cuda' if effective=='cuda' else ('cpu' if effective=='cpu' else 'unavailable'),'gpu_layers_offloaded':offloaded,'gpu_offload_verified':verified,'runtime_pid':self.process.pid if running else None,'last_inference':self._last_inference,'verification_source':['llama.cpp startup stderr'] if evidence else [],'offload_evidence':evidence,'limitations':['inference verification pending'] if not self._last_inference else []}
+            return {'state':'ready' if reachable else ('starting' if running else 'configured'),'provider':'llama.cpp-openai','model':self.model_path,'version':MODEL_VERSION,'diagnostic_mode':False,'server':'managed-lazy','gpu_mode':self.gpu_mode,'effective_gpu_mode':effective,'gpu_layers':self.gpu_layers if effective=='cuda' else 0,'gpu_acceleration_requested':self.gpu_mode=='cuda','backend_type':'cuda' if effective=='cuda' else ('cpu' if effective=='cpu' else 'unavailable'),'gpu_layers_offloaded':offloaded,'gpu_offload_verified':verified,'runtime_pid':self.process.pid if running else None,'last_inference':self._last_inference,'verification_source':['llama.cpp startup stderr'] if evidence else [],'offload_evidence':evidence,'limitations':['inference verification pending'] if not self._last_inference else ([] if reachable else ['inference endpoint is not ready'])}
         try:
             with urllib.request.urlopen(self.ollama_url+'/api/tags',timeout=2) as res: models=json.loads(res.read()).get('models',[])
             names={m.get('name') for m in models}
             if self.name not in names: return {'state':'missing','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':True,'ollama_url':self.ollama_url}
             return {'state':'ready','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'ollama_url':self.ollama_url}
         except Exception as exc: return {'state':'unavailable','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':True,'reason':type(exc).__name__}
-    def plan(self,prompt):
-        instruction=planner_prompt(prompt)
+    def plan(self,prompt,history=None):
+        instruction=planner_prompt('' if history else prompt)
+        messages=[{'role':'system','content':instruction}]
+        if history:
+            messages.extend(history)
+            messages.append({'role':'user','content':prompt})
         if self.pending_gpu_mode and not self._last_inference or (self.pending_gpu_mode and self._last_inference and self._last_inference.get('status') != 'active'):
             self.stop(); self.pending_gpu_mode=None; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None
         if self.native:
-            raw=parse_response_text(self.native.plan(instruction))
+            native_instruction=instruction
+            if history:
+                native_instruction += '\nConversation history:\n' + '\n'.join(f"{item['role']}: {item['content']}" for item in history)
+                native_instruction += '\nCurrent user request:\n' + prompt
+            raw=parse_response_text(self.native.plan(native_instruction))
             allowed={item['name'] for item in available_capabilities()}
             if any(a.get('tool') not in allowed for a in raw.get('actions',[])): raise ValueError('model returned an unauthorized capability')
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'model':self.name,'messages':[{'role':'system','content':instruction}], 'temperature':0, 'max_tokens':512, 'stream':False, 'response_format':{'type':'json_object'}}
+            body={'model':self.name,'messages':messages, 'temperature':0, 'max_tokens':512, 'stream':False, 'response_format':{'type':'json_object'}}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
-            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':instruction}]}
+            body={'model':self.name,'stream':False,'format':'json','messages':messages}
             req=urllib.request.Request(self.ollama_url+'/api/chat',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         try:
-            with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
+            with urllib.request.urlopen(req,timeout=self.inference_timeout) as res: raw=json.loads(res.read())
             self._last_inference={'status':'completed','observed_at':datetime.now(timezone.utc).isoformat()}
         except Exception:
             self._last_inference={'status':'failed','observed_at':datetime.now(timezone.utc).isoformat()}; raise
         if endpoint:
-            content=raw.get('choices',[{}])[0].get('message',{}).get('content','')
-        else: content=raw.get('message',{}).get('content','')
+            choice=(raw.get('choices') or [{}])[0] or {}
+            message=choice.get('message') or {}
+            content=message.get('content',choice.get('text',''))
+        else: content=(raw.get('message') or {}).get('content','')
+        if isinstance(content,list): content=''.join(item.get('text','') if isinstance(item,dict) else str(item) for item in content)
+        if isinstance(content,dict): content=json.dumps(content)
         raw=parse_response_text(content)
         allowed={item['name'] for item in available_capabilities()}
         if any(a.get('tool') not in allowed for a in raw.get('actions',[])): raise ValueError('model returned an unauthorized capability')
         return raw
 class AgentEngine:
-    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.workspace_active=True; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._init_db()
+    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.workspace_active=True; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._pending_risk=None; self._init_db()
     def _db(self): c=sqlite3.connect(self.db_path); c.row_factory=sqlite3.Row; return c
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True,exist_ok=True); c=self._db(); c.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,prompt TEXT,data TEXT,created_at TEXT,updated_at TEXT)'); c.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT,timestamp TEXT,action TEXT,arguments TEXT,authorization TEXT,policy_reason TEXT,risk TEXT,result TEXT,exit_code INTEGER,verification TEXT)'); c.commit(); c.close()
@@ -130,16 +164,39 @@ class AgentEngine:
     def settings(self): return {'workspace':str(self.workspace),'model':self.model.status(),'risk_service':self.risk.status(),'permission_profile':'workspace-scoped; destructive/protected actions denied','privacy':'only structured action metadata may be sent to LinuxONE','capability_scope':'approved workspace and explicit grants','grants':self.grants.list()}
     def _get(self,tid): c=self._db(); r=c.execute('SELECT data FROM tasks WHERE id=?',(tid,)).fetchone(); c.close(); return json.loads(r[0]) if r else None
     def get_task(self,tid): return self._get(tid)
-    def create_task(self,prompt):
+    def _model_plan(self,prompt,history=None,planning_prompt=None):
+        if history and isinstance(self.model,LocalModel):
+            try: return self.model.plan(prompt,history)
+            except TypeError as exc:
+                if 'positional' not in str(exc) and 'argument' not in str(exc): raise
+                return self.model.plan(planning_prompt or prompt)
+        return self.model.plan(planning_prompt or prompt)
+    def _history_for(self,prior,limit=16000):
+        if not prior: return []
+        chain=[]; current=prior
+        while current:
+            chain.append(current); parent=current.get('continuation_of'); current=self._get(parent) if parent else None
+        messages=[]
+        for task in reversed(chain):
+            for message in task.get('messages') or [{'role':'user','content':task.get('prompt','')}]:
+                if isinstance(message,dict) and message.get('role') in {'user','assistant'} and isinstance(message.get('content'),str): messages.append({'role':message['role'],'content':message['content']})
+            response=(task.get('plan') or {}).get('response')
+            if isinstance(response,str) and response.strip(): messages.append({'role':'assistant','content':response})
+            verified=[r for r in task.get('results',[]) if r.get('status')=='completed']
+            if verified: messages.append({'role':'assistant','content':'Verified tool results:\n'+json.dumps(verified,default=str)[:4000]})
+        while messages and sum(len(str(m.get('content',''))) for m in messages)>limit: messages.pop(0)
+        return messages
+    def create_task(self,prompt,session_id=None):
         started=time.perf_counter(); planner_error=None; plan=None
-        prior=self._latest_task() if self._is_continuation(prompt) else None
+        prior=self._get(session_id) if session_id else (self._latest_task() if self._is_continuation(prompt) else None)
+        history=self._history_for(prior)
         planning_prompt=self._planning_context(prompt,prior)
-        plan,planner_error=self._obtain_plan(planning_prompt,prior['prompt'] if prior else prompt)
+        plan,planner_error=self._obtain_plan(prompt,prior['prompt'] if prior else prompt,history,planning_prompt)
         source='llm' if plan else 'diagnostic'
         if not plan: plan=self._diagnostic_plan(prior['prompt'] if prior else prompt)
-        plan=self._normalize_plan(plan,prior['prompt'] if prior else prompt); now=datetime.now(timezone.utc).isoformat(); goal=prior['prompt'] if prior else prompt; t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'status':'planned','phase':'WAITING FOR EXECUTION','current_action':None,'completed_steps':0,'total_steps':len(plan.get('actions',[])),'message':'Plan ready; waiting for your execution command.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':source,'duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error},'plan':plan,'results':[],'created_at':now}; c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],goal,json.dumps(t),t['created_at'],t['created_at'])); c.commit(); c.close(); return t
-    def start_task(self,prompt):
-        prior=self._latest_task() if self._is_continuation(prompt) else None
+        plan=self._normalize_plan(plan,prior['prompt'] if prior else prompt); now=datetime.now(timezone.utc).isoformat(); goal=prior['prompt'] if prior else prompt; t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'messages':history+[{'role':'user','content':prompt}],'status':'planned','phase':'WAITING FOR EXECUTION','current_action':None,'completed_steps':0,'total_steps':len(plan.get('actions',[])),'message':'Plan ready; waiting for your execution command.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':source,'duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error},'plan':plan,'results':[],'created_at':now}; c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],goal,json.dumps(t),t['created_at'],t['created_at'])); c.commit(); c.close(); return t
+    def start_task(self,prompt,session_id=None):
+        prior=self._get(session_id) if session_id else (self._latest_task() if self._is_continuation(prompt) else None)
         if prior:
             if prior.get('status')=='awaiting_input':
                 candidates=[]
@@ -153,15 +210,14 @@ class AgentEngine:
                 else:
                     prior['message']='Choose one exact candidate path, then send it with “continue”: '+', '.join(candidates)
                 self._save_task(prior); return prior
-            prior['message']='Continuation requested; preserving the existing task and verified results.'; self._save_task(prior); return prior
-        goal=prior['prompt'] if prior else prompt; now=datetime.now(timezone.utc).isoformat()
-        t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'status':'planning','phase':'PLANNING','current_action':None,'completed_steps':0,'total_steps':0,'message':'Planning with local model.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':'pending','duration_ms':None,'error':None},'plan':{'mode':'pending','summary':'Planning with local model…','actions':[]},'results':[],'created_at':now}
+        goal=prior['prompt'] if prior else prompt; history=self._history_for(prior); now=datetime.now(timezone.utc).isoformat()
+        t={'id':str(uuid.uuid4()),'prompt':goal,'continuation_of':prior['id'] if prior else None,'messages':history+[{'role':'user','content':prompt}],'status':'planning','phase':'PLANNING','current_action':None,'completed_steps':0,'total_steps':0,'message':'Planning with local model.','started_at':now,'updated_at':now,'model_status':self.model.status(),'planning':{'source':'pending','duration_ms':None,'error':None},'plan':{'mode':'pending','summary':'Planning with local model…','actions':[]},'results':[],'created_at':now}
         c=self._db(); c.execute('INSERT INTO tasks VALUES (?,?,?,?,?)',(t['id'],goal,json.dumps(t),now,now)); c.commit(); c.close()
-        worker=threading.Thread(target=self._complete_planning,args=(t['id'],prompt,prior),daemon=True); worker.start(); worker.join(0.05)
+        worker=threading.Thread(target=self._complete_planning,args=(t['id'],prompt,prior,history),daemon=True); worker.start(); worker.join(0.05)
         return self._get(t['id']) or t
-    def _complete_planning(self,tid,prompt,prior):
+    def _complete_planning(self,tid,prompt,prior,history=None):
         started=time.perf_counter(); planner_error=None; plan=None
-        goal=prior['prompt'] if prior else prompt; plan,planner_error=self._obtain_plan(self._planning_context(prompt,prior),goal)
+        goal=prior['prompt'] if prior else prompt; planning_prompt=self._planning_context(prompt,prior); plan,planner_error=self._obtain_plan(prompt,goal,history,planning_prompt)
         retry=0
         while plan is None and self._is_transient_planner_error(planner_error) and retry<3:
             current=self._get(tid)
@@ -170,12 +226,13 @@ class AgentEngine:
             time.sleep((0.5,1.0,2.0)[retry-1])
             current=self._get(tid)
             if not current or current.get('status')=='cancelled': return
-            plan,planner_error=self._obtain_plan(self._planning_context(prompt,prior),goal)
+            plan,planner_error=self._obtain_plan(prompt,goal,history,planning_prompt)
         source='llm' if plan else 'diagnostic'
         current=self._get(tid)
         if not current or current.get('status')=='cancelled': return
-        if plan is None and self._is_transient_planner_error(planner_error):
-            current['status']='blocked'; current['phase']='ERROR'; current['message']='Local model inference did not become ready after bounded retries. Start the managed model again and retry this task.'; current['plan']={'mode':'diagnostic','summary':current['message'],'actions':[]}; current['planning']={'source':'diagnostic','duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error}; self._save_task(current); return
+        if plan is None and self._planner_error_is_terminal(planner_error):
+            message='Local model inference did not become ready after bounded retries. Start the managed model again and retry this task.' if self._is_transient_planner_error(planner_error) else f'Local model planning failed: {planner_error}'
+            current['status']='blocked'; current['phase']='ERROR'; current['message']=message; current['plan']={'mode':'error','summary':message,'actions':[]}; current['planning']={'source':'diagnostic','duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error}; self._save_task(current); return
         plan=self._normalize_plan(plan or self._diagnostic_plan(goal),goal); t=self._get(tid)
         if not t: return
         t['status']='planned'; t['phase']='WAITING FOR EXECUTION'; t['message']='Plan ready; waiting for your execution command.'; t['plan']=plan; t['total_steps']=len(plan.get('actions',[])); t['planning']={'source':source,'duration_ms':round((time.perf_counter()-started)*1000,1),'error':planner_error}; t['model_status']=self.model.status(); self._save_task(t)
@@ -183,6 +240,12 @@ class AgentEngine:
     def _is_transient_planner_error(error):
         if not isinstance(error,str): return False
         return 'HTTPError' in error and any(code in error for code in (' 503',' 502',' 504'))
+    @staticmethod
+    def _planner_error_is_terminal(error):
+        # A returned-but-invalid plan is a planner failure, not permission to
+        # invent a different executable task.  Only an empty model response
+        # retains the narrow deterministic diagnostic fallback below.
+        return isinstance(error,str) and bool(error) and not error.startswith('planner returned no usable action plan')
     def _latest_task(self):
         c=self._db(); rows=c.execute('SELECT data FROM tasks ORDER BY created_at DESC LIMIT 20').fetchall(); c.close()
         for row in rows:
@@ -210,8 +273,8 @@ class AgentEngine:
         if pdf_id not in existing:
             task['plan']['actions'].append({'id':pdf_id,'tool':'create_pdf','arguments':{'destination':'desktop','filename':'Welcome_to_Xerxes.pdf','text':{'$ref':{'step':read_id,'field':'content'}}}})
         task['total_steps']=len(task['plan']['actions'])
-    def _obtain_plan(self,planning_prompt,goal):
-        try: plan=self.model.plan(planning_prompt)
+    def _obtain_plan(self,prompt,goal,history=None,planning_prompt=None):
+        try: plan=self._model_plan(prompt,history,planning_prompt)
         except Exception as exc: return None,f'{type(exc).__name__}: {exc}'
         if not plan:
             state=self.model.status().get('state','unknown')
@@ -222,7 +285,8 @@ class AgentEngine:
             self._validate_plan(plan,goal); return plan,None
         except ValueError as first:
             try:
-                retry=self.model.plan(planner_prompt('Correct the previous response for this request. Validation feedback: '+str(first)+'\nOriginal goal:\n'+goal+'\nReturn one corrected response using the same contract; do not invent paths or results.'))
+                correction='Correct the previous response for this request. Validation feedback: '+str(first)+'\nOriginal goal:\n'+goal+'\nReturn one corrected response using the same contract; do not invent paths or results.'
+                retry=self._model_plan(correction,history)
                 retry=self._normalize_plan(retry or {},goal)
                 if isinstance(retry.get('response'),str) and not retry.get('actions'): return retry,None
                 self._validate_plan(retry,goal); return retry,None
@@ -346,12 +410,20 @@ class AgentEngine:
             if location and clues:
                 actions=[{'tool':'search_workspace','arguments':{'path':location,'query':' '.join(dict.fromkeys(clues)),'mode':'filename'}}]
         summary='Intelligent planning is unavailable.'
-        if actions: summary+=' A safe location-specific search was derived from the request; dependent actions require real results.'
+        if actions and any(a.get('tool')=='search_workspace' for a in actions): summary+=' A safe location-specific search was derived from the request; dependent actions require real results.'
+        elif actions: summary+=' A narrowly scoped fallback action was derived from the request.'
         else: summary+=' No task-specific actions were inferred; configure and verify the local model before continuing.'
         return {'mode':'diagnostic','summary':summary,'actions':actions}
     def tool_catalog(self): return [{'name':item['name'],'description':item['description'],'state':item['state'],'risk':item['risk'],'approval':item['approval']} for item in available_capabilities()]
     def list_tree(self): return self.policy.list_tree() if self.workspace_active else []
-    def _run(self,tid,a):
+    @staticmethod
+    def _risk_metadata(name,decision):
+        return {'action_category':name,'inside_workspace':decision.allowed,'reversible':name in {'list_workspace','read_file','search_workspace'},'network':False,'approval':bool(capability(name) and capability(name).get('approval')),'data_sensitivity':'workspace-metadata','privilege':'user'}
+    def _assess(self,name,decision):
+        try: return self.risk.score(self._risk_metadata(name,decision))
+        except Exception as exc: return {'state':'unavailable','reason':type(exc).__name__}
+    def _run(self,tid,a,risk=None):
+        if risk is None: risk=self._pending_risk
         name=a.get('tool'); args=a.get('arguments') or {}
         registered=capability(name)
         if not registered or registered.get('state')!='available' or not registered.get('handler'):
@@ -360,17 +432,20 @@ class AgentEngine:
         if self._has_placeholder(args):
             reason='unresolved action result reference; run the producing action successfully or provide an explicit path'
             self._audit(tid,name,args,'denied',reason,verification='not_run'); return {'tool':name,'status':'blocked','reason':reason}
-        d=self.policy.check(name,args); meta={'action_category':name,'inside_workspace':d.allowed,'reversible':name in {'list_workspace','read_file','search_workspace'},'network':False,'approval':False,'data_sensitivity':'workspace-metadata','privilege':'user'}; risk=None
-        try: risk=self.risk.score(meta)
-        except Exception as exc: risk={'state':'unavailable','reason':type(exc).__name__}
-        if not d.allowed: self._audit(tid,name,args,'denied',d.reason,risk,verification='not_run'); return {'tool':name,'status':'blocked','reason':d.reason,'risk':risk}
+        d=self.policy.check(name,args); risk=self._assess(name,d) if risk is None else risk
+        advisory= f"LinuxONE advisory: {risk.get('category')} ({risk.get('risk_score')})" if isinstance(risk,dict) and isinstance(risk.get('category'),str) and isinstance(risk.get('risk_score'),(int,float)) else 'LinuxONE advisory unavailable; local policy remains authoritative'
+        decision_reason=d.reason+'; '+advisory
+        if not d.allowed: self._audit(tid,name,args,'denied',decision_reason,risk,verification='not_run'); return {'tool':name,'status':'blocked','reason':d.reason,'risk':risk,'policy_decision':d.reason}
         if name in {'apply_patch','create_file','create_pdf'} and self._cancelled(tid):
             return {'tool':name,'status':'blocked','reason':'task was cancelled before filesystem write'}
+        search_info=None
         if name=='list_workspace': result=self.policy.list_tree()
         elif name=='read_file': result=self.policy.read_file(args.get('path',''))
-        elif name=='search_workspace': result=self.policy.search(args.get('query',''),args.get('path','.') or '.',args.get('mode','content'))
+        elif name=='search_workspace':
+            result=self.policy.search(args.get('query',''),args.get('path','.') or '.',args.get('mode','content'))
+            search_info=self.policy.last_search_info
         elif name=='run_tests':
-            proc=subprocess.run(self.policy.command(args.get('command','')),cwd=self.workspace,capture_output=True,text=True,timeout=60,shell=False); result={'stdout':proc.stdout[-12000:],'stderr':proc.stderr[-12000:],'exit_code':proc.returncode}; self._audit(tid,name,args,'allowed',d.reason,risk,result,proc.returncode,'passed' if proc.returncode==0 else 'failed'); return {'tool':name,'status':'completed' if proc.returncode==0 else 'failed','result':result,'risk':risk}
+            proc=subprocess.run(self.policy.command(args.get('command','')),cwd=self.workspace,capture_output=True,text=True,timeout=60,shell=False); result={'stdout':proc.stdout[-12000:],'stderr':proc.stderr[-12000:],'exit_code':proc.returncode}; self._audit(tid,name,args,'allowed',decision_reason,risk,result,proc.returncode,'passed' if proc.returncode==0 else 'failed'); return {'tool':name,'status':'completed' if proc.returncode==0 else 'failed','result':result,'risk':risk,'policy_decision':d.reason}
         elif name=='create_file':
             target=self.policy.file_target(args)
             target.write_text(args['content'],encoding='utf-8',newline='')
@@ -387,7 +462,10 @@ class AgentEngine:
             path.write_text(before.replace(old,new,1),encoding='utf-8'); after=path.read_text(encoding='utf-8')
             result={'path':args['path'],'changed':before!=after,'diff':'\n'.join(difflib.unified_diff(before.splitlines(),after.splitlines(),fromfile=args['path'],tofile=args['path'])),'verified':after==before.replace(old,new,1)}
         else: result={'message':'tool not enabled in this vertical slice'}
-        self._audit(tid,name,args,'allowed',d.reason,risk,result,0,'verified'); return {'tool':name,'status':'completed','result':result,'risk':risk}
+        self._audit(tid,name,args,'allowed',decision_reason,risk,result,0,'verified')
+        response={'tool':name,'status':'completed','result':result,'risk':risk,'policy_decision':d.reason}
+        if search_info is not None: response['search_info']=search_info
+        return response
     def _resolve_references(self,value,results):
         if isinstance(value,dict) and '$ref' in value:
             ref=value['$ref']; matches=[r for r in results if r.get('id')==ref.get('step') or r.get('tool')==ref.get('step')]
@@ -416,12 +494,17 @@ class AgentEngine:
     def _cancelled(self,tid):
         current=self._get(tid)
         return not current or current.get('status')=='cancelled'
+    @staticmethod
+    def _plan_identity(plan):
+        return hashlib.sha256(json.dumps(plan,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
     def execute(self,tid,approve=False):
         t=self._get(tid)
         if not t: raise KeyError(tid)
         if t.get('status')=='awaiting_input': raise ValueError('a candidate selection is required before execution')
         self._current_selected_path=t.get('selected_candidate',{}).get('path') if isinstance(t.get('selected_candidate'),dict) else None
         if self._cancelled(tid): return self._get(tid) or t
+        plan_identity=self._plan_identity(t.get('plan',{}))
+        if approve: t['approval_scope']={'plan_identity':plan_identity,'approved_at':datetime.now(timezone.utc).isoformat()}
         prior_results=t.get('results',[]) if t.get('status')=='approval_required' and approve else []
         t['status']='executing'; t['phase']='EXECUTING'; t['message']='Starting approved actions.'; t['current_action']=None; t['completed_steps']=sum(1 for r in prior_results if r.get('status')=='completed'); t['total_steps']=len(t['plan'].get('actions',[])); t['results']=prior_results; self._save_task(t)
         if not t['plan'].get('actions') and t['plan'].get('mode')=='diagnostic':
@@ -443,13 +526,22 @@ class AgentEngine:
             except ValueError as exc:
                 blocked={'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':str(exc)}; t['results'].append(blocked); t['status']='blocked'; t['phase']='ERROR'; t['message']=str(exc); self._save_task(t); break
             a['arguments']=args
+            local_decision=self.policy.check(a.get('tool'),args)
+            risk=self._assess(a.get('tool'),local_decision) if local_decision.allowed else None
+            remote_high=isinstance(risk,dict) and risk.get('category')=='high'
+            requires_approval=bool(capability(a.get('tool')) and capability(a.get('tool')).get('approval')) or (remote_high and a.get('tool') not in {'list_workspace','search_workspace','read_file'})
             if a.get('tool') in {'apply_patch','create_file','create_pdf'}:
                 if self._cancelled(tid): return self._get(tid) or t
-                decision=self.policy.check(a.get('tool'),args)
+                decision=local_decision
                 if not decision.allowed:
                     t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':decision.reason}); t['status']='blocked'; t['phase']='ERROR'; t['message']=decision.reason; self._save_task(t); break
-                if not approve:
-                    t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'approval_required','arguments':args}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before writing files.'; self._save_task(t); break
+                approved_scope=t.get('approval_scope',{}).get('plan_identity')==plan_identity
+                if requires_approval and not approved_scope:
+                    t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'approval_required','arguments':args,'risk':risk,'policy_decision':decision.reason}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before executing this action.'; self._save_task(t); break
+            elif requires_approval:
+                approved_scope=t.get('approval_scope',{}).get('plan_identity')==plan_identity
+                if not approved_scope:
+                    t['results'].append({'id':a.get('id'),'tool':a.get('tool'),'status':'approval_required','arguments':args,'risk':risk,'policy_decision':local_decision.reason}); t['status']='approval_required'; t['phase']='WAITING FOR APPROVAL'; t['message']='Waiting for your approval before executing this action.'; self._save_task(t); break
             if a.get('tool')=='create_pdf' and 'readme' in t.get('prompt','').lower():
                 read_results=[r.get('result') for r in t['results'] if r.get('tool')=='read_file' and r.get('status')=='completed']
                 if not read_results: t['status']='blocked'; t['results'].append({'tool':'create_pdf','status':'blocked','reason':'README content was not read; PDF was not created'}); break
@@ -457,11 +549,14 @@ class AgentEngine:
                 args['text']=welcome+'\n\n'+read_results[-1]['content']; a={**a,'arguments':args}
             t['phase'],t['message']=self._phase(a.get('tool')); t['current_action']=a.get('tool'); self._save_task(t)
             try:
+                self._pending_risk=risk
                 result=self._run(tid,a); result['id']=a.get('id')
             except Exception as exc:
                 current=self._get(tid)
                 if current and current.get('status')=='cancelled': return current
                 result={'id':a.get('id'),'tool':a.get('tool'),'status':'failed','reason':f'{type(exc).__name__}: {str(exc)[:240]}'}
+            finally:
+                self._pending_risk=None
             current=self._get(tid)
             if not current: return t
             if current.get('status')=='cancelled':
@@ -489,7 +584,7 @@ class AgentEngine:
                 if len(matches)>1:
                     t['candidates']=[{'id':item.get('id') or f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
                     t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
-        else: t['status']='completed'; t['phase']='COMPLETED'; t['message']='All actions completed successfully.'; t['current_action']=None; self._save_task(t)
+        else: t['status']='completed'; t['phase']='COMPLETED'; t['message']='All actions completed successfully.'; t['current_action']=None; t.pop('approval_scope',None); self._save_task(t)
         self._current_selected_path=None
         return t
     def select_candidate(self,tid,candidate_id):
@@ -507,4 +602,4 @@ class AgentEngine:
         t=self._get(tid)
         if not t: raise KeyError(tid)
         if t.get('status') in {'completed','failed','blocked','error','cancelled'}: return t
-        t['status']='cancelled'; t['phase']='CANCELLED'; t['message']='Task cancelled by user.'; self._save_task(t); self._audit(tid,'cancel',{},'allowed','user cancellation',verification='verified'); return t
+        t['status']='cancelled'; t['phase']='CANCELLED'; t['message']='Task cancelled by user.'; t.pop('approval_scope',None); self._save_task(t); self._audit(tid,'cancel',{},'allowed','user cancellation',verification='verified'); return t

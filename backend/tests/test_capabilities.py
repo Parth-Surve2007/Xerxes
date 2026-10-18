@@ -88,3 +88,11 @@ def test_string_reference_has_exact_shape_and_arbitrary_dict_is_rejected():
         except ValueError:
             continue
         raise AssertionError('invalid reference shape must be rejected')
+
+def test_response_parser_recovers_json_surrounded_by_explanation_and_rejects_truncation():
+    plan=parse_response_text('Here is the requested plan:\n{"type":"plan","actions":[{"tool":"list_workspace","arguments":{}}]}\n')
+    assert plan['actions'][0]['tool']=='list_workspace'
+    for output in ('{"type":"plan","actions":[{"tool":"list_workspace"', '{"type":"plan","actions":'):
+        try: parse_response_text(output)
+        except ValueError: continue
+        raise AssertionError('truncated JSON must remain rejected')

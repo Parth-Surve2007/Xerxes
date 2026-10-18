@@ -37,8 +37,16 @@ def planner_prompt(user_prompt):
 def parse_response_text(text):
     if not isinstance(text,str) or not text.strip(): raise ValueError('model returned empty output')
     fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',text,re.S)
-    try: raw=json.loads(fenced.group(1) if fenced else text.strip())
-    except (TypeError,json.JSONDecodeError) as exc: raise ValueError(f'model returned invalid JSON: {type(exc).__name__}') from exc
+    candidate=fenced.group(1).strip() if fenced else text.strip()
+    try: raw=json.loads(candidate)
+    except (TypeError,json.JSONDecodeError) as exc:
+        starts=[index for index,char in enumerate(candidate) if char in '[{']
+        recovered=None
+        for index in starts:
+            try: recovered,_=json.JSONDecoder().raw_decode(candidate[index:]); break
+            except json.JSONDecodeError: continue
+        if recovered is None: raise ValueError(f'model returned invalid JSON: {type(exc).__name__}') from exc
+        raw=recovered
     if isinstance(raw,list): raw={'type':'plan','actions':raw}
     if not isinstance(raw,dict): raise ValueError('model response must be a JSON object')
     actions=raw.get('actions',[])
