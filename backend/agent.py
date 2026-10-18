@@ -57,19 +57,19 @@ class LocalModel:
             fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',text,re.S)
             candidate=fenced.group(1) if fenced else text
             raw=json.loads(candidate)
-            if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: raise ValueError('native model returned invalid action plan')
-            for action in raw['actions']:
+            if not isinstance(raw,dict) or (not isinstance(raw.get('actions'),list) and not isinstance(raw.get('response'),str)) or len(raw.get('actions',[]))>12: raise ValueError('native model returned invalid model response')
+            for action in raw.get('actions',[]):
                 if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
             allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
-            if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): raise ValueError('native model returned unauthorized action')
+            if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw.get('actions',[])): raise ValueError('native model returned unauthorized action')
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
+            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON. For ordinary conversation, return {"response":"...","actions":[]} with no tools. For requests requiring workspace work, return an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
-            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON with an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}]}
+            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON. For ordinary conversation, return {"response":"...","actions":[]} with no tools. For requests requiring workspace work, return an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}]}
             req=urllib.request.Request(self.ollama_url+'/api/chat',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
         if endpoint:
@@ -78,11 +78,11 @@ class LocalModel:
             raw=json.loads(fenced.group(1) if fenced else content)
         else: raw=json.loads(raw.get('message',{}).get('content','{}'))
         if isinstance(raw,list): raw={'actions':raw}
-        if not isinstance(raw,dict) or not isinstance(raw.get('actions'),list) or len(raw['actions'])>12: return None
-        for action in raw['actions']:
+        if not isinstance(raw,dict) or (not isinstance(raw.get('actions'),list) and not isinstance(raw.get('response'),str)) or len(raw.get('actions',[]))>12: return None
+        for action in raw.get('actions',[]):
             if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
         allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
-        if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw['actions']): return None
+        if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw.get('actions',[])): return None
         return raw
 class RiskClient:
     def __init__(self): self.url=os.environ.get('XERXES_RISK_URL','').rstrip('/')
@@ -96,7 +96,7 @@ class RiskClient:
         req=urllib.request.Request(self.url+'/api/v1/risk/score',data=json.dumps(metadata).encode(),headers={'Content-Type':'application/json'},method='POST')
         with urllib.request.urlopen(req,timeout=5) as res: return json.loads(res.read())
 class AgentEngine:
-    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._init_db()
+    def __init__(self,workspace,db_path,grant_path=None): self.workspace=workspace; self.workspace_active=True; self.grants=GrantStore(grant_path or str(Path(db_path).with_name('grants.json'))); self.policy=Policy(workspace,self.grants); self.model=LocalModel(); self.risk=RiskClient(); self.db_path=db_path; self._current_selected_path=None; self._init_db()
     def _db(self): c=sqlite3.connect(self.db_path); c.row_factory=sqlite3.Row; return c
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True,exist_ok=True); c=self._db(); c.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,prompt TEXT,data TEXT,created_at TEXT,updated_at TEXT)'); c.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT,timestamp TEXT,action TEXT,arguments TEXT,authorization TEXT,policy_reason TEXT,risk TEXT,result TEXT,exit_code INTEGER,verification TEXT)'); c.commit(); c.close()
@@ -193,11 +193,15 @@ class AgentEngine:
             state=self.model.status().get('state','unknown')
             return None,f'planner returned no usable action plan (runtime state: {state})'
         try:
-            plan=self._normalize_plan(plan,goal); self._validate_plan(plan,goal); return plan,None
+            plan=self._normalize_plan(plan,goal)
+            if isinstance(plan.get('response'),str) and not plan.get('actions'): return plan,None
+            self._validate_plan(plan,goal); return plan,None
         except ValueError as first:
             try:
                 retry=self.model.plan('Correct the ungrounded plan. Original goal:\n'+goal+'\nValidation feedback: '+str(first)+'\nReturn only a grounded action plan using actual dependencies; do not invent paths or results.')
-                retry=self._normalize_plan(retry or {},goal); self._validate_plan(retry,goal); return retry,None
+                retry=self._normalize_plan(retry or {},goal)
+                if isinstance(retry.get('response'),str) and not retry.get('actions'): return retry,None
+                self._validate_plan(retry,goal); return retry,None
             except Exception as exc: return None,f'ungrounded plan: {exc}'
     def _validate_plan(self,plan,goal):
         actions=plan.get('actions',[]); lower=goal.lower(); names=[a.get('tool') for a in actions]
@@ -215,8 +219,11 @@ class AgentEngine:
             raise ValueError('unrelated test action for a filesystem-content task')
         if 'desktop' in lower:
             searches=[a for a in actions if a.get('tool')=='search_workspace']
-            if not searches: raise ValueError('explicit Desktop request requires a scoped search')
-            if any(str(a.get('arguments',{}).get('path','')).casefold() not in {'desktop'} for a in searches): raise ValueError('explicit Desktop request must search the authorized Desktop root')
+            writes=[a for a in actions if a.get('tool')=='apply_patch']
+            if not searches and not (writes and any(x in lower for x in ('create','make','write'))):
+                raise ValueError('explicit Desktop request requires a scoped search')
+            if any(not self.policy.is_desktop_root(a.get('arguments',{}).get('path','desktop')) for a in searches): raise ValueError('explicit Desktop request must search the authorized Desktop root')
+            if any(not self.policy.is_desktop_path(a.get('arguments',{}).get('path','')) for a in writes): raise ValueError('explicit Desktop write must target the authorized Desktop root')
             if any('todo' in str(a.get('arguments',{}).get('query','')).casefold() for a in searches): raise ValueError('generic TODO search is unrelated to the requested Desktop file')
             if any(a.get('tool')=='create_pdf' and str(a.get('arguments',{}).get('destination','desktop')).casefold() not in {'desktop',''} for a in actions): raise ValueError('explicit Desktop destination cannot be replaced')
         if any(n=='create_pdf' for n in names):
@@ -287,6 +294,14 @@ class AgentEngine:
         return False
     def _diagnostic_plan(self,prompt):
         lower=prompt.lower(); actions=[]
+        if any(word in lower for word in ('create','make','write')) and re.search(r'\b(?:txt|text file)\b',lower):
+            destination='desktop'
+            match=re.search(r'path\s+((?:[a-z]:[\\/])[^\n]+?)(?:\s+and\s+in\s+it|\s+and\s+write|$)',prompt,re.I)
+            if match: destination=match.group(1).rstrip(' \\"\'')
+            elif 'desktop' not in lower: destination='.'
+            content_match=re.search(r'(?:write|contain(?:ing)?)\s+["“\']([^"”\']+)["”\']?',prompt,re.I)
+            content=content_match.group(1) if content_match else 'hello world'
+            actions=[{'tool':'apply_patch','arguments':{'path':str(Path(destination)/'Xerxes_note.txt'),'old_text':'','new_text':content}}]
         if any(word in lower for word in ('search','find','hidden','locate')):
             location='desktop' if 'desktop' in lower else None
             clues=re.findall(r'\b(?:hehe|huhu|riri|hihi|ruru|eheh|hihy|hih[iy]|rir[iy])\b',lower)
@@ -297,7 +312,7 @@ class AgentEngine:
         else: summary+=' No task-specific actions were inferred; configure and verify the local model before continuing.'
         return {'mode':'diagnostic','summary':summary,'actions':actions}
     def tool_catalog(self): return [{'name':'list_workspace','risk':'low'},{'name':'read_file','risk':'low'},{'name':'search_workspace','risk':'low'},{'name':'run_tests','risk':'medium'},{'name':'apply_patch','risk':'high; approval required'},{'name':'create_pdf','risk':'medium; approval required'}]
-    def list_tree(self): return self.policy.list_tree()
+    def list_tree(self): return self.policy.list_tree() if self.workspace_active else []
     def _run(self,tid,a):
         name=a.get('tool'); args=a.get('arguments') or {}
         if self._has_placeholder(args):

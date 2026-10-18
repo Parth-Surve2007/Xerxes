@@ -8,8 +8,10 @@ const mount = () => {
   if (!api || !panel || loading) return;
   loading = true;
   const existing = panel.querySelector('.grant-list'); if (existing) existing.remove();
+  const oldHeading = panel.querySelector('.grants-heading'); if (oldHeading) oldHeading.remove();
   fetch(`${api}/grants`).then(r => { if (!r.ok) throw new Error(`Grant refresh failed (${r.status})`); return r.json(); }).then(data => {
     const list = document.createElement('div'); list.className = 'grant-list';
+    const heading = document.createElement('h3'); heading.className = 'grants-heading'; heading.textContent = 'Authorized locations'; panel.append(heading);
     const unique = new Map(); (data.grants || []).forEach(grant => unique.set(String(grant.path).toLowerCase(), grant)); unique.forEach(grant => {
       const row = document.createElement('div'); row.className = 'grant-row';
       const label = document.createElement('code'); label.textContent = grant.path;

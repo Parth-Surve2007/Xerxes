@@ -8,18 +8,22 @@ from capabilities import catalog
 app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=512*1024
 CORS(app, origins=os.environ.get('XERXES_CORS_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(','))
 DB_PATH=os.environ.get('XERXES_DATABASE',str(Path(__file__).resolve().parent/'xerxes.db'))
-WORKSPACE=Path(os.environ.get('XERXES_WORKSPACE',Path(__file__).resolve().parents[1])).resolve(); engine=AgentEngine(WORKSPACE,DB_PATH)
+configured_workspace=os.environ.get('XERXES_WORKSPACE','').strip()
+WORKSPACE=Path(configured_workspace or Path(__file__).resolve().parents[1]).resolve(); ACTIVE_WORKSPACE=WORKSPACE if configured_workspace else None; engine=AgentEngine(WORKSPACE,DB_PATH); engine.workspace_active=bool(configured_workspace)
 MAX_TASK_PROMPT=32*1024
 def err(message,code=400): return jsonify({'error':{'message':message}}),code
 @app.get('/api/v1/health')
-def health(): return jsonify({'status':'ok','product':'xerxes','architecture':platform.machine(),'workspace':str(WORKSPACE),'model':engine.model.status(),'risk_service':engine.risk.status()})
+def health(): return jsonify({'status':'ok','product':'xerxes','architecture':platform.machine(),'workspace':str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None,'model':engine.model.status(),'risk_service':engine.risk.status()})
 @app.get('/api/v1/settings')
-def settings(): return jsonify(engine.settings())
+def settings():
+    data=engine.settings(); data['workspace']=str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None; return jsonify(data)
 @app.get('/api/v1/audit')
 def audit(): return jsonify({'items':engine.audit(min(100,max(1,int(request.args.get('limit',50)))) )})
 @app.get('/api/v1/workspace/tree')
 def tree():
-    try: return jsonify({'root':str(WORKSPACE),'items':engine.list_tree()})
+    try:
+        if ACTIVE_WORKSPACE is None: return jsonify({'root':None,'items':[]})
+        return jsonify({'root':str(ACTIVE_WORKSPACE),'items':engine.list_tree()})
     except ValueError as exc: return err(str(exc),403)
 @app.post('/api/v1/workspace')
 def set_workspace():
@@ -28,7 +32,8 @@ def set_workspace():
     try:
         candidate=Path((request.get_json(silent=True) or {}).get('path','')).resolve()
         if not candidate.is_dir(): raise ValueError('workspace folder is invalid')
-        engine.workspace=candidate; engine.policy.root=candidate
+        global ACTIVE_WORKSPACE
+        engine.workspace=candidate; engine.policy.root=candidate; engine.workspace_active=True; ACTIVE_WORKSPACE=candidate
         return jsonify({'workspace':str(candidate)})
     except (ValueError,OSError) as exc: return err(str(exc),400)
 @app.post('/api/v1/tasks')
@@ -67,7 +72,7 @@ def select_task_candidate(task_id):
 @app.get('/api/v1/tools')
 def tools(): return jsonify({'tools':engine.tool_catalog()})
 @app.get('/api/v1/capabilities')
-def capabilities(): return jsonify({'capabilities':catalog(),'workspace':str(engine.workspace),'grants':engine.grants.list()})
+def capabilities(): return jsonify({'capabilities':catalog(),'workspace':str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None,'grants':engine.grants.list()})
 @app.get('/api/v1/grants')
 def grants(): return jsonify({'grants':engine.grants.list()})
 @app.post('/api/v1/grants')

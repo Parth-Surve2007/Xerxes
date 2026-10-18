@@ -11,13 +11,28 @@ class Policy:
     ALLOWED_COMMANDS={'pytest backend/tests -q':[sys.executable,'-m','pytest','backend/tests','-q'],'npm run build':[('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],'python -m pytest backend/tests -q':[sys.executable,'-m','pytest','backend/tests','-q']}
     def __init__(self,root,grants=None): self.root=Path(root).resolve(); self.grants=grants
     def roots(self): return [self.root]+[Path(x['path']).resolve() for x in (self.grants.list() if self.grants else [])]
+    def desktop_root(self):
+        desktops=[root for root in self.roots() if root.name.casefold()=='desktop']
+        if not desktops: raise ValueError('Desktop is not an approved folder')
+        return desktops[0]
+    def is_desktop_root(self, value):
+        try:
+            return self.resolve(value)==self.desktop_root()
+        except (ValueError, OSError):
+            return False
+    def is_desktop_path(self, value):
+        try:
+            candidate=self.resolve(value)
+            desktop=self.desktop_root()
+            return candidate==desktop or desktop in candidate.parents
+        except (ValueError, OSError):
+            return False
     def resolve(self,relative):
         if not relative: raise ValueError('path is required')
         relative_text=str(relative).replace('\\','/')
         if relative_text.casefold()=='desktop' or relative_text.casefold().startswith('desktop/'):
-            desktop=[root for root in self.roots() if root.name.casefold()=='desktop']
-            if not desktop: raise ValueError('Desktop is not an approved folder')
-            relative=str(desktop[0]/relative_text.split('/',1)[1]) if '/' in relative_text else str(desktop[0])
+            desktop=self.desktop_root()
+            relative=str(desktop/relative_text.split('/',1)[1]) if '/' in relative_text else str(desktop)
         candidate=(self.root/relative).resolve()
         if not any(candidate==root or root in candidate.parents for root in self.roots()): raise ValueError('path is outside approved folders')
         if any(part in self.SECRET_NAMES or part.lower().endswith(('.pem','.key')) for part in candidate.parts): raise ValueError('protected credential path denied')

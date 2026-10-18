@@ -55,6 +55,22 @@ def test_successful_planner_response_controls_plan(tmp_path,monkeypatch):
     task=module.engine.create_task('find something')
     assert task['planning']['source']=='llm' and task['plan']['summary']=='model selected read'
 
+def test_conversational_model_response_creates_no_actions(tmp_path,monkeypatch):
+    import app as module
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'response':'Hello — how can I help?','actions':[]}
+    task=module.engine.create_task('hello')
+    assert task['plan']['actions']==[] and task['planning']['source']=='llm'
+
+def test_conversational_response_is_persisted_in_task_contract(tmp_path,monkeypatch):
+    import app as module
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.model.plan=lambda prompt:{'response':'Hello from the local assistant.','actions':[]}
+    task=module.engine.create_task('hello')
+    restored=module.engine.get_task(task['id'])
+    assert restored['plan']['response']=='Hello from the local assistant.'
+    assert restored['plan']['actions']==[]
+
 def test_planner_registry_name_is_normalized_to_canonical_tool(tmp_path,monkeypatch):
     import app as module
     module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
@@ -388,6 +404,35 @@ def test_long_task_prompt_is_not_used_as_search_query(tmp_path,monkeypatch):
     assert task['plan']['actions'][0]['arguments']['query']=='hihi'
     assert seen[0]==long_prompt
 
+def test_desktop_text_creation_diagnostic_fallback_uses_authorized_root(tmp_path):
+    import app as module
+    workspace=tmp_path/'workspace'; workspace.mkdir(); desktop=tmp_path/'Desktop'; desktop.mkdir()
+    module.engine=module.AgentEngine(workspace,str(tmp_path/'agent.db')); module.engine.grants.add(desktop)
+    module.engine.model.plan=lambda prompt: None
+    task=module.engine.create_task('make a txt file in Desktop and in it write "hello"')
+    action=task['plan']['actions'][0]
+    assert task['planning']['source']=='diagnostic' and action['tool']=='apply_patch'
+    assert module.engine.policy.resolve(action['arguments']['path']).parent==desktop.resolve()
+    assert action['arguments']['new_text']=='hello'
+
+def test_desktop_absolute_path_plan_is_accepted_case_insensitively(tmp_path):
+    import app as module
+    workspace=tmp_path/'workspace'; workspace.mkdir(); desktop=tmp_path/'Desktop'; desktop.mkdir()
+    module.engine=module.AgentEngine(workspace,str(tmp_path/'agent.db')); module.engine.grants.add(desktop)
+    requested=str(desktop).replace('Desktop','DESKTOP')
+    module.engine.model.plan=lambda prompt:{'actions':[{'tool':'apply_patch','arguments':{'path':requested+'\\note.txt','old_text':'','new_text':'hello world'}}]}
+    task=module.engine.create_task('make a txt file in this path '+requested+' and in it write hello world')
+    assert task['planning']['source']=='llm'
+    assert module.engine.policy.resolve(task['plan']['actions'][0]['arguments']['path'])==desktop/'note.txt'
+
+def test_desktop_write_outside_authorized_root_remains_rejected(tmp_path):
+    import app as module
+    workspace=tmp_path/'workspace'; workspace.mkdir(); desktop=tmp_path/'Desktop'; desktop.mkdir(); outside=tmp_path/'Other'; outside.mkdir()
+    module.engine=module.AgentEngine(workspace,str(tmp_path/'agent.db')); module.engine.grants.add(desktop)
+    module.engine.model.plan=lambda prompt:{'actions':[{'tool':'apply_patch','arguments':{'path':str(outside/'note.txt'),'old_text':'','new_text':'x'}}]}
+    task=module.engine.create_task('make a txt file in Desktop and write x')
+    assert task['planning']['source']=='diagnostic' and 'ungrounded plan' in task['planning']['error']
+
 def test_oversized_generated_search_query_is_replanned_not_executed(tmp_path,monkeypatch):
     import app as module
     module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
@@ -399,3 +444,19 @@ def test_oversized_generated_search_query_is_replanned_not_executed(tmp_path,mon
     module.engine.model.plan=plan
     task=module.engine.create_task('Find a file in the approved workspace')
     assert len(calls)==2 and task['plan']['actions']==[]
+
+def test_health_does_not_expose_internal_safe_root_without_workspace(monkeypatch,tmp_path):
+    import app as module
+    module.ACTIVE_WORKSPACE=None
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    response=module.app.test_client().get('/api/v1/health')
+    assert response.status_code==200 and response.get_json()['workspace'] is None
+
+def test_no_active_workspace_hides_internal_tree_and_list_workspace(tmp_path):
+    import app as module
+    module.ACTIVE_WORKSPACE=None
+    module.engine=module.AgentEngine(tmp_path,str(tmp_path/'agent.db'))
+    module.engine.workspace_active=False
+    client=module.app.test_client()
+    assert client.get('/api/v1/workspace/tree').get_json()=={'root':None,'items':[]}
+    assert module.engine.list_tree()==[]

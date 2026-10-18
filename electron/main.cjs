@@ -33,7 +33,7 @@ async function startBackend() {
   startupLog('starting backend');
   apiPort = await freePort();
   const root = backendRoot();
-  const workspace = process.env.XERXES_WORKSPACE || configuredWorkspace() || (app.isPackaged ? app.getPath('documents') : path.join(__dirname, '..'));
+  const workspace = process.env.XERXES_WORKSPACE || configuredWorkspace() || '';
   const database = path.join(app.getPath('userData'), 'xerxes.db');
   const python = process.env.XERXES_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   const localModel = path.join(process.env.LOCALAPPDATA || '', 'Xerxes', 'models', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf');
