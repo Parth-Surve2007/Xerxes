@@ -17,3 +17,4 @@ runtime/
 native-source/
 native-build*/
 *.db
+Keys/Xerxes_key.pem

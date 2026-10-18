@@ -65,3 +65,24 @@ def test_search_stops_after_grant_revocation(tmp_path):
     store=GrantStore(tmp_path/'grants.json'); grant=store.add(desktop); policy=Policy(workspace,store)
     assert policy.search('revocation','desktop'); store.revoke(grant['id'])
     with pytest.raises(ValueError): policy.search('revocation','desktop')
+
+def test_filename_exact_matches_rank_before_substrings_and_ids_are_stable(tmp_path):
+    workspace=tmp_path/'workspace'; workspace.mkdir(); (workspace/'note.txt').write_text('partial',encoding='utf-8'); (workspace/'hihi.txt').write_text('exact',encoding='utf-8')
+    policy=Policy(workspace)
+    first=policy.search('hihi, note',mode='filename'); second=policy.search('hihi, note',mode='filename')
+    assert first[0]['path'].endswith('hihi.txt') and first[0]['match_type']=='exact'
+    assert [item['id'] for item in first]==[item['id'] for item in second]
+
+def test_prunes_excluded_directories_but_keeps_similar_legitimate_names(tmp_path):
+    workspace=tmp_path/'workspace'; workspace.mkdir(); (workspace/'build'/'nested').mkdir(parents=True); (workspace/'my-build-notes').mkdir(); (workspace/'cache-data').mkdir()
+    (workspace/'build'/'nested'/'bad.txt').write_text('bad',encoding='utf-8'); (workspace/'my-build-notes'/'good.txt').write_text('good',encoding='utf-8'); (workspace/'cache-data'/'also-good.txt').write_text('good',encoding='utf-8')
+    results=Policy(workspace).search('good',mode='filename')
+    paths={item['path'] for item in results}
+    assert any('my-build-notes' in path for path in paths) and any('cache-data' in path for path in paths)
+    assert not any('build/nested' in path for path in paths)
+
+def test_content_search_skips_binary_and_oversized_files(tmp_path):
+    workspace=tmp_path/'workspace'; workspace.mkdir(); (workspace/'binary.bin').write_bytes(b'needle\x00\xff'); (workspace/'large.txt').write_text('needle',encoding='utf-8'); (workspace/'large.txt').write_bytes(b'needle'+b'x'*(512*1024))
+    results=Policy(workspace).search('needle',mode='content')
+    assert not any(item['path'].endswith('binary.bin') for item in results)
+    assert not any(item['path'].endswith('large.txt') for item in results)

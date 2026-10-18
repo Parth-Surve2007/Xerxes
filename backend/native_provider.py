@@ -70,11 +70,7 @@ class NativeProvider:
             self._ensure_handle()
             output = ctypes.create_string_buffer(8192)
             error = ctypes.create_string_buffer(1024)
-            instruction = ("You are Xerxes planning safe workspace actions. Return ONLY one valid JSON object, with no explanation or markdown. "
-                           "It must contain an actions array. Each action must contain tool and arguments. "
-                           "Allowed tools are list_workspace, read_file, search_workspace, run_tests, apply_patch, create_pdf. "
-                           "User request: " + prompt)
-            code = self._lib.xerxes_model_generate(self._handle, instruction.encode(), 128, output, len(output), error, len(error))
+            code = self._lib.xerxes_model_generate(self._handle, prompt.encode(), 128, output, len(output), error, len(error))
             if code < 0:
                 raise RuntimeError(f"native generation failed (code {code}): {error.value.decode(errors='replace')}")
             text = output.value.decode(errors="replace").strip()

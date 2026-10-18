@@ -8,6 +8,7 @@ from capabilities import catalog
 app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=512*1024
 CORS(app, origins=os.environ.get('XERXES_CORS_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(','))
 DB_PATH=os.environ.get('XERXES_DATABASE',str(Path(__file__).resolve().parent/'xerxes.db'))
+os.environ.setdefault('XERXES_RUNTIME_SETTINGS',str(Path(DB_PATH).with_name('runtime-settings.json')))
 configured_workspace=os.environ.get('XERXES_WORKSPACE','').strip()
 WORKSPACE=Path(configured_workspace or Path(__file__).resolve().parents[1]).resolve(); ACTIVE_WORKSPACE=WORKSPACE if configured_workspace else None; engine=AgentEngine(WORKSPACE,DB_PATH); engine.workspace_active=bool(configured_workspace)
 MAX_TASK_PROMPT=32*1024
@@ -17,6 +18,11 @@ def health(): return jsonify({'status':'ok','product':'xerxes','architecture':pl
 @app.get('/api/v1/settings')
 def settings():
     data=engine.settings(); data['workspace']=str(ACTIVE_WORKSPACE) if ACTIVE_WORKSPACE else None; return jsonify(data)
+@app.post('/api/v1/runtime/gpu')
+def set_gpu():
+    payload=request.get_json(silent=True) or {}
+    if not isinstance(payload.get('enabled'),bool): return err('enabled must be boolean')
+    return jsonify(engine.model.set_gpu_mode(payload['enabled']))
 @app.get('/api/v1/audit')
 def audit(): return jsonify({'items':engine.audit(min(100,max(1,int(request.args.get('limit',50)))) )})
 @app.get('/api/v1/workspace/tree')

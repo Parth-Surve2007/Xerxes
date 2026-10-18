@@ -4,7 +4,7 @@ from pathlib import Path
 from policy import Policy
 from native_provider import NativeProvider
 from grants import GrantStore
-from capabilities import planner_contract
+from capabilities import available_capabilities, capability, parse_response_text, planner_prompt, validate_arguments
 MODEL_VERSION='local-adapter-v1'
 class LocalModel:
     def __init__(self):
@@ -13,37 +13,76 @@ class LocalModel:
         self.server_exe=os.environ.get('XERXES_LLAMA_SERVER_EXE','').strip()
         self.model_path=os.environ.get('XERXES_LOCAL_MODEL_PATH','').strip()
         self.server_host='127.0.0.1'; self.server_port=int(os.environ.get('XERXES_LLAMA_SERVER_PORT','56322')); self.process=None
+        self.settings_path=Path(os.environ.get('XERXES_RUNTIME_SETTINGS','')).expanduser() if os.environ.get('XERXES_RUNTIME_SETTINGS') else None
+        self.gpu_mode=self._load_gpu_mode(os.environ.get('XERXES_GPU_MODE','cpu'))
+        self.gpu_layers=max(0,int(os.environ.get('XERXES_GPU_LAYERS','12')))
         self.ollama_url=os.environ.get('XERXES_OLLAMA_URL','http://127.0.0.1:11434').rstrip('/')
-        self.name=os.environ.get('XERXES_LOCAL_MODEL','qwen2.5-coder:1.5b')
+        self.name=os.environ.get('XERXES_LOCAL_MODEL','qwen2.5-coder:1.5b'); self.effective_gpu_mode=None; self.pending_gpu_mode=None; self._log_lines=[]; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None; self._log_lock=threading.Lock()
         atexit.register(self.stop)
+    def _load_gpu_mode(self, fallback):
+        try:
+            value=json.loads(self.settings_path.read_text(encoding='utf-8')).get('gpu_mode') if self.settings_path and self.settings_path.is_file() else fallback
+            return value if value in {'cpu','cuda'} else 'cpu'
+        except (OSError,ValueError,TypeError): return 'cpu'
+    @staticmethod
+    def parse_offload_log(line):
+        match=re.search(r'(?:offload|offloaded|offloading).*?(\d+)\s*(?:/\s*\d+\s*)?layers?\s+(?:to|on)\s+(?:the\s+)?GPU',line,re.I)
+        return int(match.group(1)) if match else None
+    @staticmethod
+    def parse_gpu_layer_log(line):
+        match=re.search(r'\blayer\s+(\d+)\s+assigned\s+to\s+device\s+CUDA\d+\b',line,re.I)
+        return int(match.group(1)) if match else None
     def _server_url(self): return f'http://{self.server_host}:{self.server_port}'
+    def _server_args(self): return [self.server_exe,'-m',self.model_path,'--host',self.server_host,'--port',str(self.server_port),'-c','2048','-ngl',str(self.gpu_layers if self.gpu_mode=='cuda' else 0),'-n','128','--log-verbosity','5']
+    def _capture_stream(self, stream):
+        for raw in stream:
+            line=raw.decode(errors='replace').rstrip()
+            with self._log_lock:
+                self._log_lines.append(line); self._log_lines=self._log_lines[-200:]
+                parsed=self.parse_offload_log(line)
+                if parsed is not None: self._gpu_layers_offloaded=parsed
+                layer=self.parse_gpu_layer_log(line)
+                if layer is not None:
+                    self._gpu_layer_ids.add(layer); self._gpu_layers_offloaded=len(self._gpu_layer_ids); self._offload_evidence.append(line); self._offload_evidence=self._offload_evidence[-20:]
     def _ensure_server(self):
         if self.url: return self.url.rstrip('/')
         if not (self.server_exe and self.model_path): return ''
         if self.process and self.process.poll() is None: return self._server_url()
-        args=[self.server_exe,'-m',self.model_path,'--host',self.server_host,'--port',str(self.server_port),'-c','2048','-ngl','0','-n','128']
-        self.process=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,cwd=str(Path(self.server_exe).parent))
+        args=self._server_args()
+        self.process=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=str(Path(self.server_exe).parent))
+        threading.Thread(target=self._capture_stream,args=(self.process.stdout,),daemon=True).start()
+        threading.Thread(target=self._capture_stream,args=(self.process.stderr,),daemon=True).start()
         for _ in range(90):
             try:
                 with urllib.request.urlopen(self._server_url()+'/health',timeout=2) as res:
-                    if res.status==200: return self._server_url()
+                    if res.status==200: self.effective_gpu_mode=self.gpu_mode; return self._server_url()
             except Exception: pass
             if self.process.poll() is not None: break
             import time; time.sleep(1)
         error=self.process.stderr.read(4000).decode(errors='replace') if self.process else ''
         self.stop(); raise RuntimeError(f'llama-server failed to become ready: {error[-1000:]}')
+    def set_gpu_mode(self, enabled):
+        mode='cuda' if bool(enabled) else 'cpu'
+        if self.settings_path:
+            self.settings_path.parent.mkdir(parents=True,exist_ok=True); self.settings_path.write_text(json.dumps({'gpu_mode':mode},indent=2),encoding='utf-8')
+        was_running=bool(self.process and self.process.poll() is None); self.gpu_mode=mode; self.pending_gpu_mode=mode if was_running and mode != self.effective_gpu_mode else None
+        return {'requested':mode,'effective':self.effective_gpu_mode if was_running else None,'restart_pending':bool(self.pending_gpu_mode)}
     def stop(self):
         if self.native:
             self.native.stop()
             return
         if self.process and self.process.poll() is None: self.process.terminate()
-        self.process=None
+        self.process=None; self.effective_gpu_mode=None; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None
     def status(self):
         if self.native: return self.native.status()
-        if self.url: return {'state':'ready','provider':'llama.cpp-openai','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'url':self.url}
+        if self.url: return {'state':'ready','provider':'llama.cpp-openai','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'url':self.url,'gpu_mode':self.gpu_mode}
         if self.server_exe and self.model_path:
             running=bool(self.process and self.process.poll() is None)
-            return {'state':'ready' if running else 'configured','provider':'llama.cpp-openai','model':self.model_path,'version':MODEL_VERSION,'diagnostic_mode':False,'server':'managed-lazy'}
+            offloaded=self._gpu_layers_offloaded if running else None
+            verified=bool(running and self.gpu_mode=='cuda' and offloaded and offloaded>0 and self._last_inference and self._last_inference.get('status')=='completed')
+            effective=self.effective_gpu_mode if running else ('cpu' if self.gpu_mode=='cpu' else None)
+            evidence=self._offload_evidence[-3:]
+            return {'state':'ready' if running else 'configured','provider':'llama.cpp-openai','model':self.model_path,'version':MODEL_VERSION,'diagnostic_mode':False,'server':'managed-lazy','gpu_mode':self.gpu_mode,'effective_gpu_mode':effective,'gpu_layers':self.gpu_layers if effective=='cuda' else 0,'gpu_acceleration_requested':self.gpu_mode=='cuda','backend_type':'cuda' if effective=='cuda' else ('cpu' if effective=='cpu' else 'unavailable'),'gpu_layers_offloaded':offloaded,'gpu_offload_verified':verified,'runtime_pid':self.process.pid if running else None,'last_inference':self._last_inference,'verification_source':['llama.cpp startup stderr'] if evidence else [],'offload_evidence':evidence,'limitations':['inference verification pending'] if not self._last_inference else []}
         try:
             with urllib.request.urlopen(self.ollama_url+'/api/tags',timeout=2) as res: models=json.loads(res.read()).get('models',[])
             names={m.get('name') for m in models}
@@ -51,38 +90,33 @@ class LocalModel:
             return {'state':'ready','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':False,'ollama_url':self.ollama_url}
         except Exception as exc: return {'state':'unavailable','provider':'ollama','model':self.name,'version':MODEL_VERSION,'diagnostic_mode':True,'reason':type(exc).__name__}
     def plan(self,prompt):
-        contract=json.dumps(planner_contract(),separators=(',',':'))
+        instruction=planner_prompt(prompt)
+        if self.pending_gpu_mode and not self._last_inference or (self.pending_gpu_mode and self._last_inference and self._last_inference.get('status') != 'active'):
+            self.stop(); self.pending_gpu_mode=None; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None
         if self.native:
-            text=self.native.plan(prompt)
-            fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',text,re.S)
-            candidate=fenced.group(1) if fenced else text
-            raw=json.loads(candidate)
-            if not isinstance(raw,dict) or (not isinstance(raw.get('actions'),list) and not isinstance(raw.get('response'),str)) or len(raw.get('actions',[]))>12: raise ValueError('native model returned invalid model response')
-            for action in raw.get('actions',[]):
-                if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
-            allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
-            if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw.get('actions',[])): raise ValueError('native model returned unauthorized action')
+            raw=parse_response_text(self.native.plan(instruction))
+            allowed={item['name'] for item in available_capabilities()}
+            if any(a.get('tool') not in allowed for a in raw.get('actions',[])): raise ValueError('model returned an unauthorized capability')
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'model':self.name,'messages':[{'role':'system','content':'Return only JSON. For ordinary conversation, return {"response":"...","actions":[]} with no tools. For requests requiring workspace work, return an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}], 'temperature':0, 'max_tokens':512, 'stream':False}
+            body={'model':self.name,'messages':[{'role':'system','content':instruction}], 'temperature':0, 'max_tokens':512, 'stream':False, 'response_format':{'type':'json_object'}}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
-            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':'Return only JSON. For ordinary conversation, return {"response":"...","actions":[]} with no tools. For requests requiring workspace work, return an actions array. Each action must use the key "tool" for its registered capability name (not "name"). Use only these registered tool contracts and preserve declared dependencies: '+contract},{'role':'user','content':prompt}]}
+            body={'model':self.name,'stream':False,'format':'json','messages':[{'role':'system','content':instruction}]}
             req=urllib.request.Request(self.ollama_url+'/api/chat',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
-        with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
+        try:
+            with urllib.request.urlopen(req,timeout=120) as res: raw=json.loads(res.read())
+            self._last_inference={'status':'completed','observed_at':datetime.now(timezone.utc).isoformat()}
+        except Exception:
+            self._last_inference={'status':'failed','observed_at':datetime.now(timezone.utc).isoformat()}; raise
         if endpoint:
-            content=raw.get('choices',[{}])[0].get('message',{}).get('content','{}').strip()
-            fenced=re.search(r'```(?:json)?\s*(.*?)\s*```',content,re.S)
-            raw=json.loads(fenced.group(1) if fenced else content)
-        else: raw=json.loads(raw.get('message',{}).get('content','{}'))
-        if isinstance(raw,list): raw={'actions':raw}
-        if not isinstance(raw,dict) or (not isinstance(raw.get('actions'),list) and not isinstance(raw.get('response'),str)) or len(raw.get('actions',[]))>12: return None
-        for action in raw.get('actions',[]):
-            if isinstance(action,dict) and 'tool' not in action and isinstance(action.get('name'),str): action['tool']=action.pop('name')
-        allowed={'list_workspace','read_file','search_workspace','run_tests','apply_patch','create_pdf'}
-        if any(not isinstance(a,dict) or a.get('tool') not in allowed or not isinstance(a.get('arguments',{}),dict) for a in raw.get('actions',[])): return None
+            content=raw.get('choices',[{}])[0].get('message',{}).get('content','')
+        else: content=raw.get('message',{}).get('content','')
+        raw=parse_response_text(content)
+        allowed={item['name'] for item in available_capabilities()}
+        if any(a.get('tool') not in allowed for a in raw.get('actions',[])): raise ValueError('model returned an unauthorized capability')
         return raw
 class RiskClient:
     def __init__(self): self.url=os.environ.get('XERXES_RISK_URL','').rstrip('/')
@@ -198,18 +232,16 @@ class AgentEngine:
             self._validate_plan(plan,goal); return plan,None
         except ValueError as first:
             try:
-                retry=self.model.plan('Correct the ungrounded plan. Original goal:\n'+goal+'\nValidation feedback: '+str(first)+'\nReturn only a grounded action plan using actual dependencies; do not invent paths or results.')
+                retry=self.model.plan(planner_prompt('Correct the previous response for this request. Validation feedback: '+str(first)+'\nOriginal goal:\n'+goal+'\nReturn one corrected response using the same contract; do not invent paths or results.'))
                 retry=self._normalize_plan(retry or {},goal)
                 if isinstance(retry.get('response'),str) and not retry.get('actions'): return retry,None
                 self._validate_plan(retry,goal); return retry,None
             except Exception as exc: return None,f'ungrounded plan: {exc}'
     def _validate_plan(self,plan,goal):
         actions=plan.get('actions',[]); lower=goal.lower(); names=[a.get('tool') for a in actions]
-        allowed_args={'list_workspace':set(),'search_workspace':{'query','path','mode'},'read_file':{'path'},'run_tests':{'command'},'apply_patch':{'path','old_text','new_text'},'create_pdf':{'filename','destination','text','title'}}
         for action in actions:
             tool=action.get('tool'); args=action.get('arguments',{})
-            if tool not in allowed_args: raise ValueError(f'unsupported tool: {tool}')
-            if not isinstance(args,dict) or any(key not in allowed_args[tool] for key in args): raise ValueError(f'unsupported arguments for {tool}')
+            validate_arguments(tool,args)
         for action in actions:
             if action.get('tool')=='search_workspace':
                 query=action.get('arguments',{}).get('query')
@@ -217,20 +249,22 @@ class AgentEngine:
                 if len(query)>100: raise ValueError('search_workspace query exceeds the 100-character tool limit; derive concise search terms')
         if any(n=='run_tests' for n in names) and any(x in lower for x in ('pdf','hidden file','find a file','read')):
             raise ValueError('unrelated test action for a filesystem-content task')
+        needs_source=any(word in lower for word in ('hidden','find','locate','read','contents','source file'))
         if 'desktop' in lower:
             searches=[a for a in actions if a.get('tool')=='search_workspace']
-            writes=[a for a in actions if a.get('tool')=='apply_patch']
-            if not searches and not (writes and any(x in lower for x in ('create','make','write'))):
+            writes=[a for a in actions if a.get('tool') in {'apply_patch','create_file'}]
+            if needs_source and not searches and not (writes and any(x in lower for x in ('create','make','write'))):
                 raise ValueError('explicit Desktop request requires a scoped search')
-            if any(not self.policy.is_desktop_root(a.get('arguments',{}).get('path','desktop')) for a in searches): raise ValueError('explicit Desktop request must search the authorized Desktop root')
+            if needs_source and any(not self.policy.is_desktop_root(a.get('arguments',{}).get('path','desktop')) for a in searches): raise ValueError('explicit Desktop request must search the authorized Desktop root')
             if any(not self.policy.is_desktop_path(a.get('arguments',{}).get('path','')) for a in writes): raise ValueError('explicit Desktop write must target the authorized Desktop root')
             if any('todo' in str(a.get('arguments',{}).get('query','')).casefold() for a in searches): raise ValueError('generic TODO search is unrelated to the requested Desktop file')
             if any(a.get('tool')=='create_pdf' and str(a.get('arguments',{}).get('destination','desktop')).casefold() not in {'desktop',''} for a in actions): raise ValueError('explicit Desktop destination cannot be replaced')
-        if any(n=='create_pdf' for n in names):
+        if any(n=='create_pdf' for n in names) and needs_source:
             read_index=next((i for i,n in enumerate(names) if n=='read_file'),None)
             pdf_index=next((i for i,n in enumerate(names) if n=='create_pdf'),None)
             if read_index is None or pdf_index is None or read_index>pdf_index: raise ValueError('PDF creation requires a preceding read action')
         if any(self._has_unsupported_reference(a.get('arguments',{})) for a in actions): raise ValueError('plan contains unsupported or unresolved action result reference')
+        self._validate_reference_order(actions)
     def _save_task(self,t):
         c=self._db(); row=c.execute('SELECT data FROM tasks WHERE id=?',(t['id'],)).fetchone()
         if row:
@@ -239,7 +273,7 @@ class AgentEngine:
                 c.close(); return False
         t['updated_at']=datetime.now(timezone.utc).isoformat(); c.execute('UPDATE tasks SET data=?,updated_at=? WHERE id=?',(json.dumps(t),t['updated_at'],t['id'])); c.commit(); c.close(); return True
     @staticmethod
-    def _phase(tool): return {'search_workspace':('SEARCHING','Searching approved folders'), 'read_file':('READING FILE','Reading an authorized file'), 'create_pdf':('CREATING PDF','Creating and verifying the approved PDF'), 'apply_patch':('WRITING FILE','Applying an approved file change'), 'list_workspace':('LISTING FILES','Listing approved workspace files'), 'run_tests':('RUNNING TESTS','Running an allowlisted test command')}.get(tool,('EXECUTING','Executing approved action'))
+    def _phase(tool): return {'search_workspace':('SEARCHING','Searching approved folders'), 'read_file':('READING FILE','Reading an authorized file'), 'create_file':('CREATING FILE','Creating and verifying the approved text file'), 'create_pdf':('CREATING PDF','Creating and verifying the approved PDF'), 'apply_patch':('WRITING FILE','Applying an approved file change'), 'list_workspace':('LISTING FILES','Listing approved workspace files'), 'run_tests':('RUNNING TESTS','Running an allowlisted test command')}.get(tool,('EXECUTING','Executing approved action'))
     def _normalize_plan(self,plan,prompt):
         actions=[]
         for index,action in enumerate(plan.get('actions',[])):
@@ -263,7 +297,7 @@ class AgentEngine:
         for index,item in enumerate(actions): item['id']=item.get('id') or f"{item.get('tool','step')}-{index+1}"
         reads=[a for a in actions if a.get('tool')=='read_file']; pdfs=[a for a in actions if a.get('tool')=='create_pdf']; others=[a for a in actions if a.get('tool') not in {'read_file','create_pdf'}]
         ordered=others+reads+pdfs if wants_readme else actions
-        by_tool={a['tool']:a['id'] for a in ordered}
+        by_tool={tool:items[0]['id'] for tool in {a['tool'] for a in ordered} if len(items:=[a for a in ordered if a['tool']==tool])==1}
         for item in ordered: item['arguments']=self._normalize_references(item['arguments'],by_tool)
         return {**plan,'actions':ordered}
     @staticmethod
@@ -292,6 +326,20 @@ class AgentEngine:
             return any(AgentEngine._has_unsupported_reference(v) for v in value.values())
         if isinstance(value,list): return any(AgentEngine._has_unsupported_reference(v) for v in value)
         return False
+    @staticmethod
+    def _validate_reference_order(actions):
+        positions={action['id']:index for index,action in enumerate(actions)}
+        def visit(value, consumer_index):
+            if isinstance(value,dict) and '$ref' in value:
+                ref=value['$ref']; step=ref.get('step') if isinstance(ref,dict) else None
+                if step not in positions: raise ValueError(f'dependency producer {step} does not exist')
+                if positions[step] >= consumer_index: raise ValueError(f'dependency {step} must precede its consumer')
+                return
+            if isinstance(value,dict):
+                for nested in value.values(): visit(nested,consumer_index)
+            elif isinstance(value,list):
+                for nested in value: visit(nested,consumer_index)
+        for index,action in enumerate(actions): visit(action.get('arguments',{}),index)
     def _diagnostic_plan(self,prompt):
         lower=prompt.lower(); actions=[]
         if any(word in lower for word in ('create','make','write')) and re.search(r'\b(?:txt|text file)\b',lower):
@@ -301,7 +349,7 @@ class AgentEngine:
             elif 'desktop' not in lower: destination='.'
             content_match=re.search(r'(?:write|contain(?:ing)?)\s+["“\']([^"”\']+)["”\']?',prompt,re.I)
             content=content_match.group(1) if content_match else 'hello world'
-            actions=[{'tool':'apply_patch','arguments':{'path':str(Path(destination)/'Xerxes_note.txt'),'old_text':'','new_text':content}}]
+            actions=[{'tool':'create_file','arguments':{'path':str(Path(destination)/'Xerxes_note.txt'),'content':content}}]
         if any(word in lower for word in ('search','find','hidden','locate')):
             location='desktop' if 'desktop' in lower else None
             clues=re.findall(r'\b(?:hehe|huhu|riri|hihi|ruru|eheh|hihy|hih[iy]|rir[iy])\b',lower)
@@ -311,10 +359,14 @@ class AgentEngine:
         if actions: summary+=' A safe location-specific search was derived from the request; dependent actions require real results.'
         else: summary+=' No task-specific actions were inferred; configure and verify the local model before continuing.'
         return {'mode':'diagnostic','summary':summary,'actions':actions}
-    def tool_catalog(self): return [{'name':'list_workspace','risk':'low'},{'name':'read_file','risk':'low'},{'name':'search_workspace','risk':'low'},{'name':'run_tests','risk':'medium'},{'name':'apply_patch','risk':'high; approval required'},{'name':'create_pdf','risk':'medium; approval required'}]
+    def tool_catalog(self): return [{'name':item['name'],'description':item['description'],'state':item['state'],'risk':item['risk'],'approval':item['approval']} for item in available_capabilities()]
     def list_tree(self): return self.policy.list_tree() if self.workspace_active else []
     def _run(self,tid,a):
         name=a.get('tool'); args=a.get('arguments') or {}
+        registered=capability(name)
+        if not registered or registered.get('state')!='available' or not registered.get('handler'):
+            self._audit(tid,name,args,'denied','capability is unavailable',verification='not_run')
+            return {'tool':name,'status':'blocked','reason':'capability is unavailable'}
         if self._has_placeholder(args):
             reason='unresolved action result reference; run the producing action successfully or provide an explicit path'
             self._audit(tid,name,args,'denied',reason,verification='not_run'); return {'tool':name,'status':'blocked','reason':reason}
@@ -322,13 +374,18 @@ class AgentEngine:
         try: risk=self.risk.score(meta)
         except Exception as exc: risk={'state':'unavailable','reason':type(exc).__name__}
         if not d.allowed: self._audit(tid,name,args,'denied',d.reason,risk,verification='not_run'); return {'tool':name,'status':'blocked','reason':d.reason,'risk':risk}
-        if name in {'apply_patch','create_pdf'} and self._cancelled(tid):
+        if name in {'apply_patch','create_file','create_pdf'} and self._cancelled(tid):
             return {'tool':name,'status':'blocked','reason':'task was cancelled before filesystem write'}
         if name=='list_workspace': result=self.policy.list_tree()
         elif name=='read_file': result=self.policy.read_file(args.get('path',''))
         elif name=='search_workspace': result=self.policy.search(args.get('query',''),args.get('path','.') or '.',args.get('mode','content'))
         elif name=='run_tests':
             proc=subprocess.run(self.policy.command(args.get('command','')),cwd=self.workspace,capture_output=True,text=True,timeout=60,shell=False); result={'stdout':proc.stdout[-12000:],'stderr':proc.stderr[-12000:],'exit_code':proc.returncode}; self._audit(tid,name,args,'allowed',d.reason,risk,result,proc.returncode,'passed' if proc.returncode==0 else 'failed'); return {'tool':name,'status':'completed' if proc.returncode==0 else 'failed','result':result,'risk':risk}
+        elif name=='create_file':
+            target=self.policy.file_target(args)
+            target.write_text(args['content'],encoding='utf-8',newline='')
+            if not target.is_file() or target.read_text(encoding='utf-8')!=args['content']: raise ValueError('created file failed content verification')
+            result={'path':str(target),'created':True,'verified':True,'content':args['content']}
         elif name=='create_pdf':
             from pdf_generator import create_pdf
             normalized,destination=self.policy.pdf_target(args)
@@ -392,8 +449,11 @@ class AgentEngine:
             try: args=self._resolve_references(args,t['results'])
             except ValueError as exc:
                 blocked={'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':str(exc)}; t['results'].append(blocked); t['status']='blocked'; t['phase']='ERROR'; t['message']=str(exc); self._save_task(t); break
+            try: validate_arguments(a.get('tool'),args)
+            except ValueError as exc:
+                blocked={'id':a.get('id'),'tool':a.get('tool'),'status':'blocked','reason':str(exc)}; t['results'].append(blocked); t['status']='blocked'; t['phase']='ERROR'; t['message']=str(exc); self._save_task(t); break
             a['arguments']=args
-            if a.get('tool') in {'apply_patch','create_pdf'}:
+            if a.get('tool') in {'apply_patch','create_file','create_pdf'}:
                 if self._cancelled(tid): return self._get(tid) or t
                 decision=self.policy.check(a.get('tool'),args)
                 if not decision.allowed:
@@ -429,7 +489,7 @@ class AgentEngine:
                 if not matches:
                     t['status']='blocked'; t['phase']='ERROR'; t['message']='No matching files were found; provide a more precise filename or search clue.'; self._save_task(t); break
                 if len(matches)>1:
-                    t['candidates']=[{'id':f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
+                    t['candidates']=[{'id':item.get('id') or f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
                     t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
                 selected=matches[0].get('path')
                 if selected:
@@ -437,7 +497,7 @@ class AgentEngine:
             elif a.get('tool')=='search_workspace':
                 matches=(result.get('result') or [])
                 if len(matches)>1:
-                    t['candidates']=[{'id':f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
+                    t['candidates']=[{'id':item.get('id') or f'candidate-{index+1}','path':item.get('path'),'match':item.get('match'),'line':item.get('line')} for index,item in enumerate(matches) if isinstance(item,dict) and item.get('path')]
                     t['status']='awaiting_input'; t['phase']='WAITING FOR FILE SELECTION'; t['message']='Multiple matching files were found. Choose one of the listed paths, then continue.'; self._save_task(t); break
         else: t['status']='completed'; t['phase']='COMPLETED'; t['message']='All actions completed successfully.'; t['current_action']=None; self._save_task(t)
         self._current_selected_path=None

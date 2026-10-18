@@ -27,6 +27,8 @@ function backendRoot() {
   return path.join(__dirname, '..', 'backend');
 }
 function workspaceConfigPath() { return path.join(app.getPath('userData'), 'workspace.json'); }
+function runtimeSettingsPath() { return path.join(app.getPath('userData'), 'runtime-settings.json'); }
+function requestedGpuMode() { try { const value=JSON.parse(fs.readFileSync(runtimeSettingsPath(),'utf8')).gpu_mode; return value === 'cuda' ? 'cuda' : 'cpu'; } catch { return process.env.XERXES_GPU_MODE === 'cuda' ? 'cuda' : 'cpu'; } }
 function configuredWorkspace() { try { const value=JSON.parse(fs.readFileSync(workspaceConfigPath(),'utf8')).path; if (value && fs.existsSync(value) && fs.statSync(value).isDirectory()) return value; } catch {} return null; }
 
 async function startBackend() {
@@ -37,13 +39,20 @@ async function startBackend() {
   const database = path.join(app.getPath('userData'), 'xerxes.db');
   const python = process.env.XERXES_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   const localModel = path.join(process.env.LOCALAPPDATA || '', 'Xerxes', 'models', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf');
-  const llamaServer = path.join(process.env.LOCALAPPDATA || '', 'Xerxes', 'runtime', 'b11712-win-cpu-x64', 'llama-server.exe');
+  const runtimeRoot = path.join(process.env.LOCALAPPDATA || '', 'Xerxes', 'runtime');
+  const cpuRuntime = path.join(runtimeRoot, 'b11712-win-cpu-x64');
+  const cudaRuntime = path.join(runtimeRoot, 'b11717-win-cuda12-x64');
+  const useCuda = requestedGpuMode() === 'cuda' && fs.existsSync(path.join(cudaRuntime, 'llama-server.exe'));
+  const runtimeDir = useCuda ? cudaRuntime : cpuRuntime;
+  const llamaServer = path.join(runtimeDir, 'llama-server.exe');
+  const runtimeEnv = {...process.env, PORT: String(apiPort), XERXES_WORKSPACE: workspace, XERXES_DATABASE: database, XERXES_RUNTIME_SETTINGS: runtimeSettingsPath(), XERXES_GRANT_TOKEN: grantToken,
+    ...(useCuda ? {XERXES_GPU_MODE:'cuda', XERXES_GPU_LAYERS:process.env.XERXES_GPU_LAYERS || '12', PATH:`${cudaRuntime};${process.env.PATH || ''}`} : {XERXES_GPU_MODE:'cpu'}),
+    ...(fs.existsSync(localModel) && fs.existsSync(llamaServer) ? {XERXES_LLAMA_SERVER_EXE: llamaServer, XERXES_LOCAL_MODEL_PATH: localModel, XERXES_LOCAL_MODEL:'qwen2.5-coder-7b-instruct-q4_k_m'} : {})};
   backend = spawn(python, ['app.py'], {
     cwd: root,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    env: {...process.env, PORT: String(apiPort), XERXES_WORKSPACE: workspace, XERXES_DATABASE: database, XERXES_GRANT_TOKEN: grantToken,
-      ...(fs.existsSync(localModel) && fs.existsSync(llamaServer) ? {XERXES_LLAMA_SERVER_EXE: llamaServer, XERXES_LOCAL_MODEL_PATH: localModel, XERXES_LOCAL_MODEL:'qwen2.5-coder-7b-instruct-q4_k_m'} : {})}
+    env: runtimeEnv
   });
   if (process.env.XERXES_BACKEND_PID_FILE) fs.writeFileSync(process.env.XERXES_BACKEND_PID_FILE, String(backend.pid), 'utf8');
   if (process.send) process.send({type:'backend', pid:backend.pid, port:apiPort});
