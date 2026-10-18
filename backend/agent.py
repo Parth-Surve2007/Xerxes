@@ -18,6 +18,9 @@ class LocalModel:
         except (TypeError,ValueError): self.server_ready_timeout=90.0
         try: self.inference_timeout=max(5.0,min(180.0,float(os.environ.get('XERXES_MODEL_TIMEOUT','60'))))
         except (TypeError,ValueError): self.inference_timeout=60.0
+        try: self.context_tokens=max(1024,min(8192,int(os.environ.get('XERXES_LLAMA_CONTEXT','2048'))))
+        except (TypeError,ValueError): self.context_tokens=2048
+        self.max_output_tokens=512
         self.settings_path=Path(os.environ.get('XERXES_RUNTIME_SETTINGS','')).expanduser() if os.environ.get('XERXES_RUNTIME_SETTINGS') else None
         self.gpu_mode=self._load_gpu_mode(os.environ.get('XERXES_GPU_MODE','cpu'))
         self.gpu_layers=max(0,int(os.environ.get('XERXES_GPU_LAYERS','16')))
@@ -38,7 +41,7 @@ class LocalModel:
         match=re.search(r'\blayer\s+(\d+)\s+assigned\s+to\s+device\s+CUDA\d+\b',line,re.I)
         return int(match.group(1)) if match else None
     def _server_url(self): return f'http://{self.server_host}:{self.server_port}'
-    def _server_args(self): return [self.server_exe,'-m',self.model_path,'--host',self.server_host,'--port',str(self.server_port),'-c','2048','-ngl',str(self.gpu_layers if self.gpu_mode=='cuda' else 0),'-n','128','--log-verbosity','5']
+    def _server_args(self): return [self.server_exe,'-m',self.model_path,'--host',self.server_host,'--port',str(self.server_port),'-c',str(self.context_tokens),'-ngl',str(self.gpu_layers if self.gpu_mode=='cuda' else 0),'-n','128','--log-verbosity','5']
     def _capture_stream(self, stream):
         for raw in stream:
             line=raw.decode(errors='replace').rstrip()
@@ -116,8 +119,18 @@ class LocalModel:
         instruction=planner_prompt('' if history else prompt)
         messages=[{'role':'system','content':instruction}]
         if history:
-            messages.extend(history)
-            messages.append({'role':'user','content':prompt})
+            # llama.cpp's context is measured in tokens, not characters. Keep
+            # the contract and current request intact, then retain the newest
+            # history entries that fit before the reserved output budget.
+            budget_chars=max(1024,(self.context_tokens-self.max_output_tokens-32)*4)
+            current={'role':'user','content':prompt}
+            remaining=max(0,budget_chars-len(instruction)-len(prompt))
+            retained=[]
+            for item in reversed(history):
+                size=len(str(item.get('content','')))
+                if size>remaining: break
+                retained.append(item); remaining-=size
+            messages.extend(reversed(retained)); messages.append(current)
         if self.pending_gpu_mode and not self._last_inference or (self.pending_gpu_mode and self._last_inference and self._last_inference.get('status') != 'active'):
             self.stop(); self.pending_gpu_mode=None; self._offload_evidence=[]; self._gpu_layers_offloaded=None; self._gpu_layer_ids=set(); self._last_inference=None
         if self.native:
@@ -131,7 +144,7 @@ class LocalModel:
             return raw
         endpoint=self._ensure_server()
         if endpoint:
-            body={'model':self.name,'messages':messages, 'temperature':0, 'max_tokens':512, 'stream':False, 'response_format':{'type':'json_object'}}
+            body={'model':self.name,'messages':messages, 'temperature':0, 'max_tokens':self.max_output_tokens, 'stream':False, 'response_format':{'type':'json_object'}}
             req=urllib.request.Request(endpoint+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
         else:
             if self.status().get('state')!='ready': return None
@@ -319,6 +332,7 @@ class AgentEngine:
             if read_index is None or pdf_index is None or read_index>pdf_index: raise ValueError('PDF creation requires a preceding read action')
         if any(self._has_unsupported_reference(a.get('arguments',{})) for a in actions): raise ValueError('plan contains unsupported or unresolved action result reference')
         self._validate_reference_order(actions)
+        self._validate_reference_fields(actions)
     def _save_task(self,t):
         c=self._db(); row=c.execute('SELECT data FROM tasks WHERE id=?',(t['id'],)).fetchone()
         if row:
@@ -348,14 +362,22 @@ class AgentEngine:
             candidates=sorted(self.workspace.rglob('README.md'))
             if candidates:
                 rel=candidates[0].relative_to(self.workspace).as_posix(); actions.insert(0,{'id':'read_file-readme','tool':'read_file','arguments':{'path':rel}})
-        for index,item in enumerate(actions): item['id']=item.get('id') or f"{item.get('tool','step')}-{index+1}"
+        used_ids=set()
+        for index,item in enumerate(actions):
+            candidate=item.get('id') or f"{item.get('tool','step')}-{index+1}"
+            if not isinstance(candidate,str) or not candidate.strip() or candidate in used_ids:
+                candidate=f"{item.get('tool','step')}-{index+1}"
+                while candidate in used_ids: candidate=f"{item.get('tool','step')}-{index+1}-{len(used_ids)+1}"
+            item['id']=candidate; used_ids.add(candidate)
         reads=[a for a in actions if a.get('tool')=='read_file']; pdfs=[a for a in actions if a.get('tool')=='create_pdf']; others=[a for a in actions if a.get('tool') not in {'read_file','create_pdf'}]
         ordered=others+reads+pdfs if wants_readme else actions
+        by_id={item['id']:item['id'] for item in ordered}
         by_tool={tool:items[0]['id'] for tool in {a['tool'] for a in ordered} if len(items:=[a for a in ordered if a['tool']==tool])==1}
-        for item in ordered: item['arguments']=self._normalize_references(item['arguments'],by_tool)
+        by_ref={**by_id,**by_tool}
+        for item in ordered: item['arguments']=self._normalize_references(item['arguments'],by_ref)
         return {**plan,'actions':ordered}
     @staticmethod
-    def _normalize_references(value,by_tool):
+    def _normalize_references(value,by_ref):
         if isinstance(value,str):
             reserved={
                 'selected_file_path': ('search_workspace','file_path'),
@@ -364,13 +386,20 @@ class AgentEngine:
                 'read_file.result': ('read_file','result'),
                 'read_file.result.content': ('read_file','content'),
             }
-            if value in reserved and reserved[value][0] in by_tool:
-                step,field=reserved[value]; return {'$ref':{'step':by_tool[step],'field':field}}
+            if value in reserved and reserved[value][0] in by_ref:
+                step,field=reserved[value]; return {'$ref':{'step':by_ref[step],'field':field}}
             match=re.fullmatch(r'\{\{([A-Za-z_][\w-]*)(?:_result|\.result)(?:\.([A-Za-z_][\w-]*))?(?:\.([A-Za-z_][\w-]*))?\}\}',value)
-            if match and match.group(1) in by_tool: return {'$ref':{'step':by_tool[match.group(1)],'field':match.group(3) or match.group(2) or 'result'}}
+            if match and match.group(1) in by_ref: return {'$ref':{'step':by_ref[match.group(1)],'field':match.group(3) or match.group(2) or 'result'}}
             return value
-        if isinstance(value,dict): return {k:AgentEngine._normalize_references(v,by_tool) for k,v in value.items()}
-        if isinstance(value,list): return [AgentEngine._normalize_references(v,by_tool) for v in value]
+        if isinstance(value,dict):
+            if set(value)=={'$ref'} and isinstance(value['$ref'],dict):
+                ref=dict(value['$ref']); step=ref.get('step'); field=ref.get('field')
+                if step in by_ref: ref['step']=by_ref[step]
+                if isinstance(field,str) and field.startswith('result.'):
+                    ref['field']=field[7:]
+                return {'$ref':ref}
+            return {k:AgentEngine._normalize_references(v,by_ref) for k,v in value.items()}
+        if isinstance(value,list): return [AgentEngine._normalize_references(v,by_ref) for v in value]
         return value
     @staticmethod
     def _has_unsupported_reference(value):
@@ -394,6 +423,27 @@ class AgentEngine:
             elif isinstance(value,list):
                 for nested in value: visit(nested,consumer_index)
         for index,action in enumerate(actions): visit(action.get('arguments',{}),index)
+    @staticmethod
+    def _validate_reference_fields(actions):
+        outputs={
+            'search_workspace': {'result','path','file_path'},
+            'read_file': {'result','path','content'},
+            'list_workspace': {'result','path','file_path'},
+        }
+        by_id={action['id']:action for action in actions}
+        def visit(value):
+            if isinstance(value,dict) and '$ref' in value:
+                ref=value['$ref']; producer=by_id.get(ref.get('step'))
+                if not producer: raise ValueError(f"dependency producer {ref.get('step')} does not exist")
+                field=ref.get('field')
+                if field not in outputs.get(producer.get('tool'),set()):
+                    raise ValueError(f"dependency field {field} is not available from {producer.get('tool')}")
+                return
+            if isinstance(value,dict):
+                for nested in value.values(): visit(nested)
+            elif isinstance(value,list):
+                for nested in value: visit(nested)
+        for action in actions: visit(action.get('arguments',{}))
     def _diagnostic_plan(self,prompt):
         lower=prompt.lower(); actions=[]
         if any(word in lower for word in ('create','make','write')) and re.search(r'\b(?:txt|text file)\b',lower):
@@ -472,6 +522,12 @@ class AgentEngine:
             if len(matches)!=1 or matches[0].get('status')!='completed': raise ValueError(f"dependency {ref.get('step')} did not complete successfully")
             data=matches[0].get('result'); field=ref.get('field','result')
             if field=='result': return data
+            if isinstance(field,str) and '.' in field:
+                current=data
+                for part in field.split('.'):
+                    if not isinstance(current,dict) or part not in current: raise ValueError(f"dependency field {field} is unavailable")
+                    current=current[part]
+                return current
             if not isinstance(data,dict) or field not in data:
                 if field in {'file_path','path'} and isinstance(data,list):
                     paths=[x.get('path') for x in data if isinstance(x,dict) and x.get('path')]

@@ -73,3 +73,29 @@ def test_session_history_is_bounded(tmp_path):
     first = engine.create_task('x' * 20000)
     history = engine._history_for(first)
     assert sum(len(m['content']) for m in history) <= 16000
+
+
+def test_model_context_budget_preserves_contract_and_current_request(monkeypatch):
+    seen = {}
+
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return json.dumps({'choices': [{'message': {'content': '{"response":"ok","actions":[]}'}}]}).encode()
+
+    def open_request(request, **kwargs):
+        seen.update(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(agent.urllib.request, 'urlopen', open_request)
+    monkeypatch.setattr(agent.LocalModel, '_ensure_server', lambda self: 'http://local')
+    model = agent.LocalModel()
+    model.plan('current request must remain', [
+        {'role': 'user', 'content': 'old context ' * 1000},
+        {'role': 'assistant', 'content': 'newer context'},
+    ])
+    messages = seen['messages']
+    assert messages[0]['role'] == 'system'
+    assert messages[-1] == {'role': 'user', 'content': 'current request must remain'}
+    assert not any('old context' in message['content'] for message in messages)
